@@ -1,10 +1,11 @@
 //! End-to-end `tfmux bind` tests driven through `tfmux::run` with a fake tmux
 //! backend, a temp `TFMUX_HOME`, an injected env/cwd, and a fixed clock.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use clap::Parser;
@@ -24,6 +25,10 @@ fn fixed_now() -> DateTime<Utc> {
 struct MuxCalls {
     built: u32,
     resolved: Vec<String>,
+    loaded: Vec<(String, String)>,
+    pasted: Vec<(String, String)>,
+    enters: Vec<String>,
+    captured: Vec<(String, i32)>,
 }
 
 /// Fake tmux: records each resolve call and returns a scripted pane (or error).
@@ -31,6 +36,7 @@ struct FakeMux {
     calls: Rc<RefCell<MuxCalls>>,
     pane: PaneRef,
     err: Option<String>,
+    captures: Rc<RefCell<VecDeque<String>>>,
 }
 
 impl Mux for FakeMux {
@@ -45,20 +51,33 @@ impl Mux for FakeMux {
         })
     }
 
-    fn load_buffer(&self, _name: &str, _text: &str) -> anyhow::Result<()> {
+    fn load_buffer(&self, name: &str, text: &str) -> anyhow::Result<()> {
+        self.calls
+            .borrow_mut()
+            .loaded
+            .push((name.to_string(), text.to_string()));
         Ok(())
     }
 
-    fn paste_buffer(&self, _name: &str, _pane_id: &str) -> anyhow::Result<()> {
+    fn paste_buffer(&self, name: &str, pane_id: &str) -> anyhow::Result<()> {
+        self.calls
+            .borrow_mut()
+            .pasted
+            .push((name.to_string(), pane_id.to_string()));
         Ok(())
     }
 
-    fn send_enter(&self, _pane_id: &str) -> anyhow::Result<()> {
+    fn send_enter(&self, pane_id: &str) -> anyhow::Result<()> {
+        self.calls.borrow_mut().enters.push(pane_id.to_string());
         Ok(())
     }
 
-    fn capture_pane(&self, _pane_id: &str, _scrollback: i32) -> anyhow::Result<String> {
-        Ok(String::new())
+    fn capture_pane(&self, pane_id: &str, scrollback: i32) -> anyhow::Result<String> {
+        self.calls
+            .borrow_mut()
+            .captured
+            .push((pane_id.to_string(), scrollback));
+        Ok(self.captures.borrow_mut().pop_front().unwrap_or_default())
     }
 }
 
@@ -69,6 +88,10 @@ struct Scenario {
     env: HashMap<String, String>,
     pane: PaneRef,
     resolve_err: Option<String>,
+    stdin: String,
+    buffer_name: String,
+    captures: Rc<RefCell<VecDeque<String>>>,
+    sleeps: Rc<Cell<u32>>,
     calls: Rc<RefCell<MuxCalls>>,
 }
 
@@ -86,6 +109,10 @@ impl Scenario {
                 pane_index: "0".into(),
             },
             resolve_err: None,
+            stdin: String::new(),
+            buffer_name: "buf-test".to_string(),
+            captures: Rc::new(RefCell::new(VecDeque::from(["submitted\n".to_string()]))),
+            sleeps: Rc::new(Cell::new(0)),
             calls: Rc::new(RefCell::new(MuxCalls::default())),
         }
     }
@@ -111,6 +138,11 @@ impl Scenario {
         self
     }
 
+    fn stdin(mut self, value: &str) -> Self {
+        self.stdin = value.to_string();
+        self
+    }
+
     fn marker(self, name: &str) -> Self {
         std::fs::create_dir_all(self.cwd.path().join(".llm")).unwrap();
         std::fs::write(self.cwd.path().join(".llm/tfmux-session"), name).unwrap();
@@ -127,6 +159,26 @@ impl Scenario {
 
     fn resolved(&self) -> Vec<String> {
         self.calls.borrow().resolved.clone()
+    }
+
+    fn loaded(&self) -> Vec<(String, String)> {
+        self.calls.borrow().loaded.clone()
+    }
+
+    fn pasted(&self) -> Vec<(String, String)> {
+        self.calls.borrow().pasted.clone()
+    }
+
+    fn enters(&self) -> Vec<String> {
+        self.calls.borrow().enters.clone()
+    }
+
+    fn captured(&self) -> Vec<(String, i32)> {
+        self.calls.borrow().captured.clone()
+    }
+
+    fn sleeps(&self) -> u32 {
+        self.sleeps.get()
     }
 
     /// Number of top-level entries written under TFMUX_HOME.
@@ -160,15 +212,25 @@ impl Scenario {
         let calls = self.calls.clone();
         let pane = self.pane.clone();
         let err = self.resolve_err.clone();
+        let captures = self.captures.clone();
         let new_mux = move || -> anyhow::Result<Box<dyn Mux>> {
             calls.borrow_mut().built += 1;
             Ok(Box::new(FakeMux {
                 calls: calls.clone(),
                 pane: pane.clone(),
                 err: err.clone(),
+                captures: captures.clone(),
             }))
         };
-        let read_stdin = || -> anyhow::Result<String> { Ok(String::new()) };
+        let stdin = self.stdin.clone();
+        let read_stdin = move || -> anyhow::Result<String> { Ok(stdin.clone()) };
+        let buffer_name = self.buffer_name.clone();
+        let new_buffer_name = move || -> String { buffer_name.clone() };
+        let sleeps = self.sleeps.clone();
+        let sleep = move |duration: Duration| {
+            assert_eq!(duration, Duration::from_millis(150));
+            sleeps.set(sleeps.get() + 1);
+        };
 
         let mut out: Vec<u8> = Vec::new();
         let mut app = App {
@@ -178,6 +240,8 @@ impl Scenario {
             now: &now_fn,
             new_mux: &new_mux,
             read_stdin: &read_stdin,
+            new_buffer_name: &new_buffer_name,
+            sleep: &sleep,
             out: &mut out,
         };
         let result = tfmux::run(&mut app, cli);
@@ -420,4 +484,200 @@ fn bind_resolve_failure_writes_no_state() {
         0,
         "a failed resolve must not create a session"
     );
+}
+
+#[test]
+fn send_text_succeeds_against_bound_target() {
+    let s = Scenario::new();
+    let (bind_result, _) = s.run(&[
+        "tfmux",
+        "bind",
+        "agent1",
+        "--tmux",
+        "sess:1.0",
+        "--session",
+        "demo",
+    ]);
+    assert!(bind_result.is_ok(), "{:?}", bind_result.err());
+
+    let (send_result, stdout) = s.run(&[
+        "tfmux",
+        "send",
+        "agent1",
+        "--text",
+        "hello",
+        "--session",
+        "demo",
+    ]);
+
+    assert!(send_result.is_ok(), "{:?}", send_result.err());
+    assert_eq!(stdout, "sent 5 bytes to \"agent1\" (%5)\n");
+    assert_eq!(
+        s.loaded(),
+        vec![("buf-test".to_string(), "hello".to_string())]
+    );
+    assert_eq!(s.pasted(), vec![("buf-test".to_string(), "%5".to_string())]);
+    assert_eq!(s.enters(), vec!["%5".to_string()]);
+    assert_eq!(s.captured(), vec![("%5".to_string(), 80)]);
+    assert_eq!(s.sleeps(), 1);
+    assert_eq!(s.resolved(), vec!["sess:1.0".to_string(), "%5".to_string()]);
+}
+
+#[test]
+fn send_file_succeeds_against_bound_target() {
+    let s = Scenario::new();
+    let file = s.cwd.path().join("message.txt");
+    std::fs::write(&file, "from file").unwrap();
+    let file_arg = file.to_str().unwrap();
+    let (bind_result, _) = s.run(&[
+        "tfmux",
+        "bind",
+        "agent1",
+        "--tmux",
+        "sess:1.0",
+        "--session",
+        "demo",
+    ]);
+    assert!(bind_result.is_ok(), "{:?}", bind_result.err());
+
+    let (send_result, stdout) = s.run(&[
+        "tfmux",
+        "send",
+        "agent1",
+        "--file",
+        file_arg,
+        "--session",
+        "demo",
+    ]);
+
+    assert!(send_result.is_ok(), "{:?}", send_result.err());
+    assert_eq!(stdout, "sent 9 bytes to \"agent1\" (%5)\n");
+    assert_eq!(
+        s.loaded(),
+        vec![("buf-test".to_string(), "from file".to_string())]
+    );
+}
+
+#[test]
+fn send_stdin_succeeds_against_bound_target() {
+    let s = Scenario::new().stdin("from stdin");
+    let (bind_result, _) = s.run(&[
+        "tfmux",
+        "bind",
+        "agent1",
+        "--tmux",
+        "sess:1.0",
+        "--session",
+        "demo",
+    ]);
+    assert!(bind_result.is_ok(), "{:?}", bind_result.err());
+
+    let (send_result, stdout) = s.run(&["tfmux", "send", "agent1", "--session", "demo", "-"]);
+
+    assert!(send_result.is_ok(), "{:?}", send_result.err());
+    assert_eq!(stdout, "sent 10 bytes to \"agent1\" (%5)\n");
+    assert_eq!(
+        s.loaded(),
+        vec![("buf-test".to_string(), "from stdin".to_string())]
+    );
+}
+
+#[test]
+fn send_missing_session_errors_without_creating_state() {
+    let s = Scenario::new();
+    let (result, _) = s.run(&[
+        "tfmux",
+        "send",
+        "agent1",
+        "--text",
+        "hello",
+        "--session",
+        "demo",
+    ]);
+
+    let err = result.unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "no tfmux session selected; pass --session NAME, set TFMUX_SESSION, or add .llm/tfmux-session"
+    );
+    assert_eq!(s.built(), 0);
+    assert_eq!(s.home_entry_count(), 0);
+}
+
+#[test]
+fn send_missing_target_gives_bind_hint() {
+    let s = Scenario::new();
+    Store::new(s.home().to_path_buf())
+        .create_session("demo", fixed_now())
+        .unwrap();
+
+    let (result, _) = s.run(&[
+        "tfmux",
+        "send",
+        "agent1",
+        "--text",
+        "hello",
+        "--session",
+        "demo",
+    ]);
+
+    let err = result.unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "no target \"agent1\" in session demo; run `tfmux bind agent1 ...`"
+    );
+    assert_eq!(s.built(), 0);
+}
+
+#[test]
+fn send_resolves_session_from_env_var() {
+    let s = Scenario::new().env("TFMUX_SESSION", "envdemo");
+    let (bind_result, _) = s.run(&["tfmux", "bind", "agent1", "--tmux", "sess:1.0"]);
+    assert!(bind_result.is_ok(), "{:?}", bind_result.err());
+
+    let (send_result, stdout) = s.run(&["tfmux", "send", "agent1", "--text", "hello"]);
+
+    assert!(send_result.is_ok(), "{:?}", send_result.err());
+    assert_eq!(stdout, "sent 5 bytes to \"agent1\" (%5)\n");
+}
+
+#[test]
+fn send_resolves_session_from_local_marker() {
+    let s = Scenario::new().marker("markerdemo");
+    let (bind_result, _) = s.run(&["tfmux", "bind", "agent1", "--tmux", "sess:1.0"]);
+    assert!(bind_result.is_ok(), "{:?}", bind_result.err());
+
+    let (send_result, stdout) = s.run(&["tfmux", "send", "agent1", "--text", "hello"]);
+
+    assert!(send_result.is_ok(), "{:?}", send_result.err());
+    assert_eq!(stdout, "sent 5 bytes to \"agent1\" (%5)\n");
+}
+
+#[test]
+fn send_does_not_create_global_current_pointer() {
+    let s = Scenario::new();
+    let (bind_result, _) = s.run(&[
+        "tfmux",
+        "bind",
+        "agent1",
+        "--tmux",
+        "sess:1.0",
+        "--session",
+        "demo",
+    ]);
+    assert!(bind_result.is_ok(), "{:?}", bind_result.err());
+
+    let (send_result, _) = s.run(&[
+        "tfmux",
+        "send",
+        "agent1",
+        "--text",
+        "hello",
+        "--session",
+        "demo",
+    ]);
+
+    assert!(send_result.is_ok(), "{:?}", send_result.err());
+    assert!(!s.home().join("current").exists());
+    assert_eq!(s.home_entry_count(), 1);
 }

@@ -31,6 +31,8 @@ pub struct Cli {
 pub enum Command {
     /// Bind a named target to a canonical tmux pane.
     Bind(BindArgs),
+    /// Send text to a bound tmux pane.
+    Send(SendArgs),
 }
 
 /// Arguments for `tfmux bind`.
@@ -610,4 +612,66 @@ pub fn bind(app: &mut App, args: &BindArgs) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Handle `tfmux send`: resolve a payload and existing target, deliver it, and
+/// print the verified byte count.
+///
+/// # Errors
+/// Returns an error on invalid names/input, missing sessions or targets, tmux
+/// failures, or verification failures.
+pub fn send(app: &mut App, args: &SendArgs) -> Result<()> {
+    validate_name(&args.name)?;
+    let payload = resolve_send_payload(args, app.read_stdin)?;
+
+    let marker = store::read_session_marker(&app.cwd)?;
+    let env_session = (app.env)("TFMUX_SESSION");
+    let session_name = resolve_send_session_name(
+        args.session.as_deref(),
+        env_session.as_deref(),
+        marker.as_deref(),
+    )?;
+
+    let store = Store::new(app.base_dir.clone());
+    let session_dir = store
+        .find_session_dir(&session_name)?
+        .ok_or_else(no_send_session_selected)?;
+    let target = store
+        .load_target(&session_dir, &args.name)?
+        .ok_or_else(|| {
+            anyhow!(
+                "no target \"{}\" in session {}; run `tfmux bind {} ...`",
+                args.name,
+                session_name,
+                args.name
+            )
+        })?;
+
+    let mux = (app.new_mux)()?;
+    let buffer_name = (app.new_buffer_name)();
+    let sent = deliver_payload(mux.as_ref(), &target, &payload, &buffer_name, app.sleep)?;
+    writeln!(
+        app.out,
+        "sent {} bytes to \"{}\" ({})",
+        sent.bytes, target.name, sent.pane_id
+    )?;
+    Ok(())
+}
+
+fn resolve_send_session_name(
+    flag: Option<&str>,
+    env: Option<&str>,
+    marker: Option<&str>,
+) -> Result<String> {
+    for candidate in [flag, env, marker] {
+        if let Some(name) = candidate.map(str::trim).filter(|s| !s.is_empty()) {
+            validate_name(name)?;
+            return Ok(name.to_string());
+        }
+    }
+    Err(no_send_session_selected())
+}
+
+fn no_send_session_selected() -> anyhow::Error {
+    anyhow!("no tfmux session selected; pass --session NAME, set TFMUX_SESSION, or add .llm/tfmux-session")
 }
