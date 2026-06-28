@@ -44,6 +44,22 @@ impl Mux for FakeMux {
             ..self.pane.clone()
         })
     }
+
+    fn load_buffer(&self, _name: &str, _text: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn paste_buffer(&self, _name: &str, _pane_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn send_enter(&self, _pane_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn capture_pane(&self, _pane_id: &str, _scrollback: i32) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
 }
 
 /// Builder + driver for a single bind invocation.
