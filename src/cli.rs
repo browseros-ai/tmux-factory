@@ -211,6 +211,7 @@ fn strip_ansi(text: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use anyhow::Result;
