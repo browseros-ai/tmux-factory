@@ -1,30 +1,19 @@
 # tfmux — agent & contributor guidelines
 
-`tfmux` is a small, **synchronous** Rust CLI that lets a *mediator* drive a fleet
-of *agents*, each in its own tmux pane: it **bind**s panes to names and (later)
-**send**s them prompts. Inspired by `riff3`; shares no state, paths, or commands
-with it.
+`tfmux` is a small, **synchronous** Rust CLI for coordinating named tmux panes.
+Inspired by `riff3`; shares no state, paths, or commands with it.
 
-**Scope: `bind` only.** `send` is the planned next feature. Add no stubs,
-placeholder modules, TODO bodies, or dead scaffolding — let a failing test pull
-each new piece of code into existence.
+Add no stubs, placeholder modules, TODO bodies, or dead scaffolding — let a
+failing test pull each new piece of code into existence.
 
 These rules MUST be followed by all AI coding agents and contributors.
 
-## Commands
+## Verification commands
 
 ```bash
 cargo test                                  # in-module unit tests + e2e tests/cli.rs
 cargo fmt                                    # required before every commit
 cargo clippy --all-targets -- -D warnings   # must pass clean
-cargo run -- bind NAME --tmux sess:1.0 --session demo
-```
-
-CLI surface:
-
-```
-tfmux bind NAME (--here | --tmux TARGET) [--role mediator|agent]
-               [--kind claude|codex|generic] [--session NAME] [--json]
 ```
 
 ## Architecture (module ownership — keep these boundaries)
@@ -39,8 +28,9 @@ tfmux bind NAME (--here | --tmux TARGET) [--role mediator|agent]
 | `main.rs` | composition root | builds the real `App`; prints `error: {:#}`, exits 1 |
 | `lib.rs` | module decls + `run(app, cli)` | dispatch only |
 
-Adding a command later = one `Command` arm + one handler (+ grow the `Mux` trait /
-extend `App` only if that feature needs it). Don't cross the ownership above.
+Adding or changing a command = one `Command` arm + one handler (+ grow the `Mux`
+trait / extend `App` only if that feature needs it). Don't cross the ownership
+above.
 
 ## Core principles
 

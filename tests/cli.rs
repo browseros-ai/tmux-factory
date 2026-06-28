@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use clap::Parser;
+use serde_json::json;
 use tempfile::TempDir;
 
 use tfmux::app::App;
@@ -203,6 +204,13 @@ impl Scenario {
         let raw =
             std::fs::read_to_string(dir.join("targets").join(format!("{name}.json"))).unwrap();
         serde_json::from_str(&raw).unwrap()
+    }
+
+    fn target_path(&self, session: &str, name: &str) -> PathBuf {
+        self.session_dir(session)
+            .expect("session dir should exist")
+            .join("targets")
+            .join(format!("{name}.json"))
     }
 
     fn save_target(&self, session: &str, name: &str) {
@@ -755,4 +763,116 @@ fn send_does_not_create_global_current_pointer() {
     assert!(send_result.is_ok(), "{:?}", send_result.err());
     assert!(!s.home().join("current").exists());
     assert_eq!(s.home_entry_count(), 1);
+}
+
+#[test]
+fn unbind_explicit_session_removes_only_target_file() {
+    let s = Scenario::new();
+    s.save_target("demo", "agent1");
+    s.save_target("demo", "agent2");
+    let session_dir = s.session_dir("demo").unwrap();
+    std::fs::write(session_dir.join("events.jsonl"), "keep\n").unwrap();
+
+    let (result, stdout) = s.run(&["tfmux", "unbind", "agent1", "--session", "demo"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "unbound \"agent1\" from session demo\n");
+    assert!(!s.target_path("demo", "agent1").exists());
+    assert!(s.target_path("demo", "agent2").exists());
+    assert!(session_dir.join("session.json").exists());
+    assert_eq!(
+        std::fs::read_to_string(session_dir.join("events.jsonl")).unwrap(),
+        "keep\n"
+    );
+    assert_eq!(s.built(), 0, "unbind must not construct tmux");
+    assert!(!s.home().join("current").exists());
+    assert_eq!(s.home_entry_count(), 1);
+}
+
+#[test]
+fn unbind_json_prints_stable_payload() {
+    let s = Scenario::new();
+    s.save_target("demo", "agent1");
+
+    let (result, stdout) = s.run(&["tfmux", "unbind", "agent1", "--session", "demo", "--json"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    let printed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        printed,
+        json!({
+            "session": "demo",
+            "name": "agent1",
+            "removed": true,
+        })
+    );
+    assert!(!s.target_path("demo", "agent1").exists());
+    assert_eq!(s.built(), 0);
+}
+
+#[test]
+fn unbind_resolves_session_from_env_var() {
+    let s = Scenario::new().env("TFMUX_SESSION", "envdemo");
+    s.save_target("envdemo", "agent1");
+
+    let (result, stdout) = s.run(&["tfmux", "unbind", "agent1"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "unbound \"agent1\" from session envdemo\n");
+    assert!(!s.target_path("envdemo", "agent1").exists());
+    assert_eq!(s.built(), 0);
+}
+
+#[test]
+fn unbind_resolves_session_from_local_marker() {
+    let s = Scenario::new().marker("markerdemo");
+    s.save_target("markerdemo", "agent1");
+
+    let (result, stdout) = s.run(&["tfmux", "unbind", "agent1"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "unbound \"agent1\" from session markerdemo\n");
+    assert!(!s.target_path("markerdemo", "agent1").exists());
+    assert_eq!(s.built(), 0);
+}
+
+#[test]
+fn unbind_missing_session_errors_without_creating_state() {
+    let s = Scenario::new();
+
+    let (result, _) = s.run(&["tfmux", "unbind", "agent1", "--session", "demo"]);
+
+    let err = result.unwrap_err().to_string();
+    assert_eq!(err, "no tfmux session \"demo\"");
+    assert_eq!(s.built(), 0);
+    assert_eq!(s.home_entry_count(), 0);
+    assert!(!s.home().join("current").exists());
+}
+
+#[test]
+fn unbind_missing_target_errors_cleanly() {
+    let s = Scenario::new();
+    Store::new(s.home().to_path_buf())
+        .create_session("demo", fixed_now())
+        .unwrap();
+
+    let (result, _) = s.run(&["tfmux", "unbind", "agent1", "--session", "demo"]);
+
+    let err = result.unwrap_err().to_string();
+    assert_eq!(err, "no target \"agent1\" in session demo");
+    assert_eq!(s.built(), 0);
+    assert!(!s.home().join("current").exists());
+}
+
+#[test]
+fn unbind_invalid_name_errors_before_any_write() {
+    let s = Scenario::new();
+
+    let (result, _) = s.run(&["tfmux", "unbind", "bad/name", "--session", "demo"]);
+
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("invalid name \"bad/name\""), "got: {err}");
+    assert_eq!(s.built(), 0);
+    assert_eq!(s.home_entry_count(), 0);
+    assert!(!s.home().join("current").exists());
 }
