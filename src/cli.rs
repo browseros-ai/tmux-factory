@@ -1,13 +1,18 @@
 //! Clap surface and command handlers.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::app::App;
+use crate::mux::Mux;
 use crate::store::{self, rfc3339, Store};
 use crate::target::{validate_kind, validate_name, validate_role, Target};
+
+const SEND_SETTLE: Duration = Duration::from_millis(150);
+const SEND_CAPTURE_SCROLLBACK: i32 = 80;
 
 /// Parsed top-level CLI invocation.
 #[derive(Parser)]
@@ -110,12 +115,111 @@ pub fn resolve_send_payload(
     Ok(payload)
 }
 
+/// Result metadata from a verified send delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendDelivery {
+    pub bytes: usize,
+    pub pane_id: String,
+}
+
+/// Deliver `payload` to `target` through tmux and verify it was submitted.
+///
+/// The stored pane id is re-resolved before any paste. After paste + Enter,
+/// the pane is captured and checked for Claude/Codex pasted-content markers;
+/// one extra Enter is sent if such a marker remains visible.
+///
+/// # Errors
+/// Returns an error when the target pane is gone, the re-resolved id differs,
+/// any tmux action fails, or the pasted-content marker remains after retry.
+pub fn deliver_payload(
+    mux: &dyn Mux,
+    target: &Target,
+    payload: &str,
+    buffer_name: &str,
+    sleep: &dyn Fn(Duration),
+) -> Result<SendDelivery> {
+    let pane = mux.resolve_pane(&target.pane_id).map_err(|e| {
+        anyhow!(
+            "target \"{}\" pane {} no longer exists; rebind it: {e:#}",
+            target.name,
+            target.pane_id
+        )
+    })?;
+    if pane.pane_id != target.pane_id {
+        bail!(
+            "target \"{}\" pane re-check resolved \"{}\" to \"{}\"; rebind it",
+            target.name,
+            target.pane_id,
+            pane.pane_id
+        );
+    }
+
+    mux.load_buffer(buffer_name, payload)?;
+    mux.paste_buffer(buffer_name, &target.pane_id)?;
+    mux.send_enter(&target.pane_id)?;
+    sleep(SEND_SETTLE);
+
+    let mut stripped = strip_ansi(&mux.capture_pane(&target.pane_id, SEND_CAPTURE_SCROLLBACK)?);
+    if has_pasted_marker(&stripped) {
+        mux.send_enter(&target.pane_id)?;
+        sleep(SEND_SETTLE);
+        stripped = strip_ansi(&mux.capture_pane(&target.pane_id, SEND_CAPTURE_SCROLLBACK)?);
+    }
+
+    if has_pasted_marker(&stripped) {
+        bail!(
+            "send to \"{}\" appears unsent; pasted-content marker is still visible:\n{}",
+            target.name,
+            last_lines(&stripped, 20)
+        );
+    }
+
+    Ok(SendDelivery {
+        bytes: payload.len(),
+        pane_id: target.pane_id.clone(),
+    })
+}
+
+fn has_pasted_marker(text: &str) -> bool {
+    text.contains("[Pasted Content") || text.contains("[Pasted text")
+}
+
+fn last_lines(text: &str, count: usize) -> String {
+    let mut lines = text.lines().rev().take(count).collect::<Vec<_>>();
+    lines.reverse();
+    lines.join("\n")
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut stripped = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for escaped in chars.by_ref() {
+                if ('@'..='~').contains(&escaped) {
+                    break;
+                }
+            }
+        } else {
+            stripped.push(ch);
+        }
+    }
+    stripped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::Result;
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
     use std::fs;
     use std::path::PathBuf;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use crate::mux::{Mux, PaneRef};
 
     fn args_with_text(text: Option<&str>) -> SendArgs {
         SendArgs {
@@ -129,6 +233,95 @@ mod tests {
 
     fn stdin_reader(value: &'static str) -> impl Fn() -> Result<String> {
         move || Ok(value.to_string())
+    }
+
+    fn sample_send_target() -> Target {
+        Target {
+            name: "agent1".to_string(),
+            role: "agent".to_string(),
+            kind: "claude".to_string(),
+            input: "sess:1.0".to_string(),
+            pane_id: "%5".to_string(),
+            session: "sess".to_string(),
+            window: "1".to_string(),
+            pane_index: "0".to_string(),
+            bound_at: "2026-06-28T12:00:00Z".to_string(),
+        }
+    }
+
+    fn pane_ref(pane_id: &str) -> PaneRef {
+        PaneRef {
+            input: pane_id.to_string(),
+            pane_id: pane_id.to_string(),
+            session: "sess".to_string(),
+            window: "1".to_string(),
+            pane_index: "0".to_string(),
+        }
+    }
+
+    #[derive(Default)]
+    struct DeliveryCalls {
+        resolved: Vec<String>,
+        loaded: Vec<(String, String)>,
+        pasted: Vec<(String, String)>,
+        enters: Vec<String>,
+        captured: Vec<(String, i32)>,
+    }
+
+    struct DeliveryMux {
+        calls: Rc<RefCell<DeliveryCalls>>,
+        resolves: RefCell<VecDeque<std::result::Result<PaneRef, String>>>,
+        captures: RefCell<VecDeque<String>>,
+    }
+
+    impl DeliveryMux {
+        fn new(resolves: Vec<std::result::Result<PaneRef, String>>, captures: Vec<&str>) -> Self {
+            Self {
+                calls: Rc::new(RefCell::new(DeliveryCalls::default())),
+                resolves: RefCell::new(resolves.into_iter().collect()),
+                captures: RefCell::new(captures.into_iter().map(str::to_string).collect()),
+            }
+        }
+    }
+
+    impl Mux for DeliveryMux {
+        fn resolve_pane(&self, target: &str) -> Result<PaneRef> {
+            self.calls.borrow_mut().resolved.push(target.to_string());
+            match self.resolves.borrow_mut().pop_front() {
+                Some(Ok(pane)) => Ok(pane),
+                Some(Err(err)) => anyhow::bail!("{err}"),
+                None => Ok(pane_ref(target)),
+            }
+        }
+
+        fn load_buffer(&self, name: &str, text: &str) -> Result<()> {
+            self.calls
+                .borrow_mut()
+                .loaded
+                .push((name.to_string(), text.to_string()));
+            Ok(())
+        }
+
+        fn paste_buffer(&self, name: &str, pane_id: &str) -> Result<()> {
+            self.calls
+                .borrow_mut()
+                .pasted
+                .push((name.to_string(), pane_id.to_string()));
+            Ok(())
+        }
+
+        fn send_enter(&self, pane_id: &str) -> Result<()> {
+            self.calls.borrow_mut().enters.push(pane_id.to_string());
+            Ok(())
+        }
+
+        fn capture_pane(&self, pane_id: &str, scrollback: i32) -> Result<String> {
+            self.calls
+                .borrow_mut()
+                .captured
+                .push((pane_id.to_string(), scrollback));
+            Ok(self.captures.borrow_mut().pop_front().unwrap_or_default())
+        }
     }
 
     #[test]
@@ -219,6 +412,110 @@ mod tests {
         };
         let payload = resolve_send_payload(&args, &stdin_reader("from stdin")).unwrap();
         assert_eq!(payload, "from stdin");
+    }
+
+    #[test]
+    fn send_delivery_normal_success() {
+        let mux = DeliveryMux::new(vec![Ok(pane_ref("%5"))], vec!["\u{1b}[32mok\u{1b}[0m"]);
+        let target = sample_send_target();
+        let slept = Cell::new(0);
+
+        let sent = deliver_payload(&mux, &target, "hello", "buf1", &|duration| {
+            assert_eq!(duration, Duration::from_millis(150));
+            slept.set(slept.get() + 1);
+        })
+        .unwrap();
+
+        assert_eq!(sent.bytes, 5);
+        assert_eq!(sent.pane_id, "%5");
+        let calls = mux.calls.borrow();
+        assert_eq!(calls.resolved, vec!["%5"]);
+        assert_eq!(
+            calls.loaded,
+            vec![("buf1".to_string(), "hello".to_string())]
+        );
+        assert_eq!(calls.pasted, vec![("buf1".to_string(), "%5".to_string())]);
+        assert_eq!(calls.enters, vec!["%5"]);
+        assert_eq!(calls.captured, vec![("%5".to_string(), 80)]);
+        assert_eq!(slept.get(), 1);
+    }
+
+    #[test]
+    fn send_delivery_dead_pane_asks_to_rebind() {
+        let mux = DeliveryMux::new(vec![Err("can't find pane".to_string())], vec![]);
+        let err = deliver_payload(&mux, &sample_send_target(), "hello", "buf1", &|_| {})
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            "target \"agent1\" pane %5 no longer exists; rebind it: can't find pane"
+        );
+        assert!(mux.calls.borrow().loaded.is_empty());
+    }
+
+    #[test]
+    fn send_delivery_pane_id_mismatch_asks_to_rebind() {
+        let mux = DeliveryMux::new(vec![Ok(pane_ref("%6"))], vec![]);
+        let err = deliver_payload(&mux, &sample_send_target(), "hello", "buf1", &|_| {})
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            "target \"agent1\" pane re-check resolved \"%5\" to \"%6\"; rebind it"
+        );
+        assert!(mux.calls.borrow().loaded.is_empty());
+    }
+
+    #[test]
+    fn send_delivery_pasted_content_marker_causes_one_extra_enter() {
+        let mux = DeliveryMux::new(
+            vec![Ok(pane_ref("%5"))],
+            vec![
+                "line\n[Pasted \u{1b}[31mContent 123]\n",
+                "line\nsubmitted\n",
+            ],
+        );
+        let slept = Cell::new(0);
+
+        deliver_payload(&mux, &sample_send_target(), "hello", "buf1", &|_| {
+            slept.set(slept.get() + 1);
+        })
+        .unwrap();
+
+        let calls = mux.calls.borrow();
+        assert_eq!(calls.enters, vec!["%5", "%5"]);
+        assert_eq!(calls.captured.len(), 2);
+        assert_eq!(slept.get(), 2);
+    }
+
+    #[test]
+    fn send_delivery_marker_still_visible_returns_appears_unsent_error() {
+        let lines = (1..=25)
+            .map(|n| {
+                if n == 25 {
+                    "line25 [Pasted text 123]".to_string()
+                } else {
+                    format!("line{n}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mux = DeliveryMux::new(vec![Ok(pane_ref("%5"))], vec![&lines, &lines]);
+
+        let err = deliver_payload(&mux, &sample_send_target(), "hello", "buf1", &|_| {})
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("send to \"agent1\" appears unsent"),
+            "got: {err}"
+        );
+        assert!(err.contains("line6"), "got: {err}");
+        assert!(err.contains("line25 [Pasted text 123]"), "got: {err}");
+        assert!(!err.contains("line5\n"), "got: {err}");
+        assert_eq!(mux.calls.borrow().enters, vec!["%5", "%5"]);
     }
 }
 
