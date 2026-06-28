@@ -152,6 +152,7 @@ impl Scenario {
                 err: err.clone(),
             }))
         };
+        let read_stdin = || -> anyhow::Result<String> { Ok(String::new()) };
 
         let mut out: Vec<u8> = Vec::new();
         let mut app = App {
@@ -160,6 +161,7 @@ impl Scenario {
             cwd: self.cwd.path().to_path_buf(),
             now: &now_fn,
             new_mux: &new_mux,
+            read_stdin: &read_stdin,
             out: &mut out,
         };
         let result = tfmux::run(&mut app, cli);

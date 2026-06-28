@@ -23,6 +23,8 @@ pub struct App<'a> {
     /// Lazily-built tmux backend (constructed only when a command needs it, so
     /// pure-validation failure paths never shell out to tmux).
     pub new_mux: &'a dyn Fn() -> Result<Box<dyn Mux>>,
+    /// Read all text from stdin when a command explicitly asks for `-`.
+    pub read_stdin: &'a dyn Fn() -> Result<String>,
     /// Success output sink.
     pub out: &'a mut dyn Write,
 }

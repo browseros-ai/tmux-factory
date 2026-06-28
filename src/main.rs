@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Read};
 use std::process::ExitCode;
 
 use chrono::Utc;
@@ -23,6 +23,11 @@ fn main() -> ExitCode {
     let env_fn = |k: &str| std::env::var(k).ok();
     let now_fn = || Utc::now();
     let new_mux = || -> anyhow::Result<Box<dyn Mux>> { Ok(Box::new(Tmux::from_env()?)) };
+    let read_stdin = || -> anyhow::Result<String> {
+        let mut buf = String::new();
+        io::stdin().read_to_string(&mut buf)?;
+        Ok(buf)
+    };
     let mut out = io::stdout();
 
     let mut app = App {
@@ -31,6 +36,7 @@ fn main() -> ExitCode {
         cwd,
         now: &now_fn,
         new_mux: &new_mux,
+        read_stdin: &read_stdin,
         out: &mut out,
     };
 

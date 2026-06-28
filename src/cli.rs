@@ -1,7 +1,9 @@
 //! Clap surface and command handlers.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use std::fs;
+use std::path::PathBuf;
 
 use crate::app::App;
 use crate::store::{self, rfc3339, Store};
@@ -49,6 +51,175 @@ pub struct BindArgs {
     /// Print the stored target as JSON instead of the text summary.
     #[arg(long)]
     pub json: bool,
+}
+
+/// Arguments for `tfmux send`.
+#[derive(Args)]
+pub struct SendArgs {
+    /// Target name (a single path-safe token).
+    pub name: String,
+    /// Text payload to send.
+    #[arg(long)]
+    pub text: Option<String>,
+    /// File to read as the send payload.
+    #[arg(long, value_name = "FILE")]
+    pub file: Option<PathBuf>,
+    /// Read the send payload from stdin when this positional is `-`.
+    #[arg(value_name = "-", value_parser = ["-"])]
+    pub stdin_marker: Option<String>,
+    /// Override session selection.
+    #[arg(long, value_name = "NAME")]
+    pub session: Option<String>,
+}
+
+/// Resolve and read the payload for `tfmux send`.
+///
+/// Exactly one source must be present: `--text`, `--file`, or `-` for stdin.
+/// The returned string is guaranteed to be non-empty.
+///
+/// # Errors
+/// Returns an error when the source selection is invalid, the selected source
+/// is empty, or the file/stdin reader fails.
+pub fn resolve_send_payload(
+    args: &SendArgs,
+    read_stdin: &dyn Fn() -> Result<String>,
+) -> Result<String> {
+    let source_count = usize::from(args.text.is_some())
+        + usize::from(args.file.is_some())
+        + usize::from(args.stdin_marker.is_some());
+    match source_count {
+        0 => bail!("no input given: pass --text, --file, or -"),
+        1 => {}
+        _ => bail!("choose exactly one input source: --text, --file, or -"),
+    }
+
+    let payload = if let Some(text) = &args.text {
+        text.clone()
+    } else if let Some(path) = &args.file {
+        if path.as_os_str().is_empty() {
+            bail!("--file requires a path");
+        }
+        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
+    } else {
+        read_stdin()?
+    };
+
+    if payload.is_empty() {
+        bail!("empty payload; pass non-empty text");
+    }
+    Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn args_with_text(text: Option<&str>) -> SendArgs {
+        SendArgs {
+            name: "agent1".to_string(),
+            text: text.map(str::to_string),
+            file: None,
+            stdin_marker: None,
+            session: None,
+        }
+    }
+
+    fn stdin_reader(value: &'static str) -> impl Fn() -> Result<String> {
+        move || Ok(value.to_string())
+    }
+
+    #[test]
+    fn send_payload_rejects_no_input_source() {
+        let args = SendArgs {
+            name: "agent1".to_string(),
+            text: None,
+            file: None,
+            stdin_marker: None,
+            session: None,
+        };
+        let err = resolve_send_payload(&args, &stdin_reader("ignored"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "no input given: pass --text, --file, or -");
+    }
+
+    #[test]
+    fn send_payload_accepts_text_source() {
+        let payload =
+            resolve_send_payload(&args_with_text(Some("hello")), &stdin_reader("ignored")).unwrap();
+        assert_eq!(payload, "hello");
+    }
+
+    #[test]
+    fn send_payload_rejects_multiple_sources() {
+        let args = SendArgs {
+            name: "agent1".to_string(),
+            text: Some("hello".to_string()),
+            file: Some(PathBuf::from("message.txt")),
+            stdin_marker: Some("-".to_string()),
+            session: None,
+        };
+        let err = resolve_send_payload(&args, &stdin_reader("ignored"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "choose exactly one input source: --text, --file, or -");
+    }
+
+    #[test]
+    fn send_payload_rejects_empty_text() {
+        let err = resolve_send_payload(&args_with_text(Some("")), &stdin_reader("ignored"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "empty payload; pass non-empty text");
+    }
+
+    #[test]
+    fn send_payload_rejects_empty_file_path() {
+        let args = SendArgs {
+            name: "agent1".to_string(),
+            text: None,
+            file: Some(PathBuf::from("")),
+            stdin_marker: None,
+            session: None,
+        };
+        let err = resolve_send_payload(&args, &stdin_reader("ignored"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "--file requires a path");
+    }
+
+    #[test]
+    fn send_payload_reads_file_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("message.txt");
+        fs::write(&path, "hello from file").unwrap();
+        let args = SendArgs {
+            name: "agent1".to_string(),
+            text: None,
+            file: Some(path),
+            stdin_marker: None,
+            session: None,
+        };
+
+        let payload = resolve_send_payload(&args, &stdin_reader("ignored")).unwrap();
+        assert_eq!(payload, "hello from file");
+    }
+
+    #[test]
+    fn send_payload_reads_stdin_source() {
+        let args = SendArgs {
+            name: "agent1".to_string(),
+            text: None,
+            file: None,
+            stdin_marker: Some("-".to_string()),
+            session: None,
+        };
+        let payload = resolve_send_payload(&args, &stdin_reader("from stdin")).unwrap();
+        assert_eq!(payload, "from stdin");
+    }
 }
 
 /// Handle `tfmux bind`: resolve the session and tmux pane, then persist the
