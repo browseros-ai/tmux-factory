@@ -103,6 +103,24 @@ impl Store {
             .with_context(|| format!("decoding target {}", path.display()))?;
         Ok(Some(target))
     }
+
+    /// Delete `<session_dir>/targets/<name>.json`.
+    ///
+    /// Returns `true` when a target file was removed and `false` when it was
+    /// already absent.
+    ///
+    /// # Errors
+    /// Returns an error when `name` is invalid or the target file cannot be
+    /// deleted.
+    pub fn delete_target(&self, session_dir: &Path, name: &str) -> Result<bool> {
+        validate_name(name)?;
+        let path = session_dir.join("targets").join(format!("{name}.json"));
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(anyhow!("deleting {}: {}", path.display(), e)),
+        }
+    }
 }
 
 /// Resolve the session name from the precedence chain
@@ -392,5 +410,53 @@ mod tests {
 
         assert_eq!(store.load_target(&dir, "agent1").unwrap(), None);
         assert!(!base.path().join("current").exists());
+    }
+
+    // ---- delete_target ----
+
+    #[test]
+    fn delete_target_removes_existing_target_file() {
+        let base = tempfile::tempdir().unwrap();
+        let store = Store::new(base.path().to_path_buf());
+        let dir = store.create_session("demo", fixed_now()).unwrap();
+        store.save_target(&dir, &sample_target()).unwrap();
+
+        let removed = store.delete_target(&dir, "agent1").unwrap();
+
+        assert!(removed);
+        assert!(!dir.join("targets/agent1.json").exists());
+        assert!(dir.join("session.json").exists());
+        assert!(!base.path().join("current").exists());
+    }
+
+    #[test]
+    fn delete_target_missing_returns_false() {
+        let base = tempfile::tempdir().unwrap();
+        let store = Store::new(base.path().to_path_buf());
+        let dir = store.create_session("demo", fixed_now()).unwrap();
+
+        let removed = store.delete_target(&dir, "agent1").unwrap();
+
+        assert!(!removed);
+        assert!(dir.join("session.json").exists());
+        assert!(!base.path().join("current").exists());
+    }
+
+    #[test]
+    fn delete_target_is_constrained_to_targets_file() {
+        let base = tempfile::tempdir().unwrap();
+        let store = Store::new(base.path().to_path_buf());
+        let dir = store.create_session("demo", fixed_now()).unwrap();
+        fs::write(dir.join("agent1.json"), "outside target dir").unwrap();
+        store.save_target(&dir, &sample_target()).unwrap();
+
+        let removed = store.delete_target(&dir, "agent1").unwrap();
+
+        assert!(removed);
+        assert!(!dir.join("targets/agent1.json").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("agent1.json")).unwrap(),
+            "outside target dir"
+        );
     }
 }
