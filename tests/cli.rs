@@ -199,6 +199,23 @@ impl Scenario {
         serde_json::from_str(&raw).unwrap()
     }
 
+    fn save_target(&self, session: &str, name: &str) {
+        let store = Store::new(self.home().to_path_buf());
+        let dir = store.create_session(session, fixed_now()).unwrap();
+        let target = Target {
+            name: name.to_string(),
+            role: "agent".to_string(),
+            kind: "generic".to_string(),
+            input: "sess:1.0".to_string(),
+            pane_id: "%5".to_string(),
+            session: "sess".to_string(),
+            window: "1".to_string(),
+            pane_index: "0".to_string(),
+            bound_at: "2026-06-28T12:00:00Z".to_string(),
+        };
+        store.save_target(&dir, &target).unwrap();
+    }
+
     fn run(&self, argv: &[&str]) -> (anyhow::Result<()>, String) {
         let cli = match Cli::try_parse_from(argv.iter().copied()) {
             Ok(cli) => cli,
@@ -367,6 +384,26 @@ fn bind_resolves_session_from_local_marker() {
 
     assert!(result.is_ok(), "{:?}", result.err());
     assert!(s.session_dir("markerdemo").is_some());
+}
+
+#[test]
+fn bind_session_flag_wins_over_unreadable_marker() {
+    let s = Scenario::new();
+    std::fs::create_dir_all(s.cwd.path().join(".llm/tfmux-session")).unwrap();
+
+    let (result, stdout) = s.run(&[
+        "tfmux",
+        "bind",
+        "agent1",
+        "--tmux",
+        "sess:1.0",
+        "--session",
+        "demo",
+    ]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "bound agent1 -> %5 (sess:1.0)\n");
+    assert!(s.session_dir("demo").is_some());
 }
 
 #[test]
@@ -626,6 +663,38 @@ fn send_missing_target_gives_bind_hint() {
         err,
         "no target \"agent1\" in session demo; run `tfmux bind agent1 ...`"
     );
+    assert_eq!(s.built(), 0);
+}
+
+#[test]
+fn send_session_flag_wins_over_unreadable_marker() {
+    let s = Scenario::new();
+    s.save_target("demo", "agent1");
+    std::fs::create_dir_all(s.cwd.path().join(".llm/tfmux-session")).unwrap();
+
+    let (result, stdout) = s.run(&[
+        "tfmux",
+        "send",
+        "agent1",
+        "--text",
+        "hello",
+        "--session",
+        "demo",
+    ]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "sent 5 bytes to \"agent1\" (%5)\n");
+}
+
+#[test]
+fn send_empty_file_path_uses_custom_error() {
+    let s = Scenario::new();
+    s.save_target("demo", "agent1");
+
+    let (result, _) = s.run(&["tfmux", "send", "agent1", "--file", "", "--session", "demo"]);
+
+    let err = result.unwrap_err().to_string();
+    assert_eq!(err, "--file requires a path");
     assert_eq!(s.built(), 0);
 }
 

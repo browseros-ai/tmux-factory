@@ -3,7 +3,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::fs;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::app::App;
@@ -70,7 +69,7 @@ pub struct SendArgs {
     pub text: Option<String>,
     /// File to read as the send payload.
     #[arg(long, value_name = "FILE")]
-    pub file: Option<PathBuf>,
+    pub file: Option<String>,
     /// Read the send payload from stdin when this positional is `-`.
     #[arg(value_name = "-", value_parser = ["-"])]
     pub stdin_marker: Option<String>,
@@ -103,10 +102,10 @@ pub fn resolve_send_payload(
     let payload = if let Some(text) = &args.text {
         text.clone()
     } else if let Some(path) = &args.file {
-        if path.as_os_str().is_empty() {
+        if path.is_empty() {
             bail!("--file requires a path");
         }
-        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
+        fs::read_to_string(path).with_context(|| format!("reading {path}"))?
     } else {
         read_stdin()?
     };
@@ -153,6 +152,16 @@ pub fn deliver_payload(
             target.name,
             target.pane_id,
             pane.pane_id
+        );
+    }
+    if pane.session != target.session
+        || pane.window != target.window
+        || pane.pane_index != target.pane_index
+    {
+        bail!(
+            "target \"{}\" pane metadata changed for {}; rebind it",
+            target.name,
+            target.pane_id
         );
     }
 
@@ -218,7 +227,6 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::fs;
-    use std::path::PathBuf;
     use std::rc::Rc;
     use std::time::Duration;
 
@@ -259,6 +267,16 @@ mod tests {
             session: "sess".to_string(),
             window: "1".to_string(),
             pane_index: "0".to_string(),
+        }
+    }
+
+    fn pane_ref_at(pane_id: &str, session: &str, window: &str, pane_index: &str) -> PaneRef {
+        PaneRef {
+            input: pane_id.to_string(),
+            pane_id: pane_id.to_string(),
+            session: session.to_string(),
+            window: window.to_string(),
+            pane_index: pane_index.to_string(),
         }
     }
 
@@ -354,7 +372,7 @@ mod tests {
         let args = SendArgs {
             name: "agent1".to_string(),
             text: Some("hello".to_string()),
-            file: Some(PathBuf::from("message.txt")),
+            file: Some("message.txt".to_string()),
             stdin_marker: Some("-".to_string()),
             session: None,
         };
@@ -377,7 +395,7 @@ mod tests {
         let args = SendArgs {
             name: "agent1".to_string(),
             text: None,
-            file: Some(PathBuf::from("")),
+            file: Some(String::new()),
             stdin_marker: None,
             session: None,
         };
@@ -395,7 +413,7 @@ mod tests {
         let args = SendArgs {
             name: "agent1".to_string(),
             text: None,
-            file: Some(path),
+            file: Some(path.display().to_string()),
             stdin_marker: None,
             session: None,
         };
@@ -415,6 +433,18 @@ mod tests {
         };
         let payload = resolve_send_payload(&args, &stdin_reader("from stdin")).unwrap();
         assert_eq!(payload, "from stdin");
+    }
+
+    #[test]
+    fn send_cli_parser_preserves_empty_file_path() {
+        let cli =
+            Cli::try_parse_from(["tfmux", "send", "agent1", "--file", "", "--session", "demo"])
+                .unwrap();
+
+        match cli.command {
+            Command::Send(args) => assert_eq!(args.file.as_deref(), Some("")),
+            Command::Bind(_) => panic!("expected send command"),
+        }
     }
 
     #[test]
@@ -467,6 +497,20 @@ mod tests {
         assert_eq!(
             err,
             "target \"agent1\" pane re-check resolved \"%5\" to \"%6\"; rebind it"
+        );
+        assert!(mux.calls.borrow().loaded.is_empty());
+    }
+
+    #[test]
+    fn send_delivery_pane_metadata_mismatch_asks_to_rebind() {
+        let mux = DeliveryMux::new(vec![Ok(pane_ref_at("%5", "other", "1", "0"))], vec![]);
+        let err = deliver_payload(&mux, &sample_send_target(), "hello", "buf1", &|_| {})
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            "target \"agent1\" pane metadata changed for %5; rebind it"
         );
         assert!(mux.calls.borrow().loaded.is_empty());
     }
@@ -544,9 +588,13 @@ pub fn bind(app: &mut App, args: &BindArgs) -> Result<()> {
         bail!("choose exactly one target source: --here or --tmux TARGET");
     }
 
-    // Resolve the session name (read-only; precedence + path-safe validation).
-    let marker = store::read_session_marker(&app.cwd)?;
     let env_session = (app.env)("TFMUX_SESSION");
+    // Resolve the session name (read-only; precedence + path-safe validation).
+    let marker = if has_flag_or_env_session(args.session.as_deref(), env_session.as_deref()) {
+        None
+    } else {
+        store::read_session_marker(&app.cwd)?
+    };
     let session_name = store::resolve_session_name(
         args.session.as_deref(),
         env_session.as_deref(),
@@ -625,8 +673,12 @@ pub fn send(app: &mut App, args: &SendArgs) -> Result<()> {
     validate_name(&args.name)?;
     let payload = resolve_send_payload(args, app.read_stdin)?;
 
-    let marker = store::read_session_marker(&app.cwd)?;
     let env_session = (app.env)("TFMUX_SESSION");
+    let marker = if has_flag_or_env_session(args.session.as_deref(), env_session.as_deref()) {
+        None
+    } else {
+        store::read_session_marker(&app.cwd)?
+    };
     let session_name = resolve_send_session_name(
         args.session.as_deref(),
         env_session.as_deref(),
@@ -671,6 +723,13 @@ fn resolve_send_session_name(
         }
     }
     Err(no_send_session_selected())
+}
+
+fn has_flag_or_env_session(flag: Option<&str>, env: Option<&str>) -> bool {
+    [flag, env]
+        .into_iter()
+        .flatten()
+        .any(|candidate| !candidate.trim().is_empty())
 }
 
 fn no_send_session_selected() -> anyhow::Error {
