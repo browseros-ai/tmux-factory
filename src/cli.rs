@@ -29,6 +29,8 @@ pub enum Command {
     Bind(BindArgs),
     /// Send text to a bound tmux pane.
     Send(SendArgs),
+    /// Attach a detached tmux session in a new window.
+    Attach(AttachArgs),
     /// Remove a bound target from a session.
     Unbind(UnbindArgs),
     /// List bound targets in an existing session.
@@ -77,6 +79,16 @@ pub struct SendArgs {
     /// Override session selection.
     #[arg(long, value_name = "NAME")]
     pub session: Option<String>,
+}
+
+/// Arguments for `tfmux attach`.
+#[derive(Args)]
+pub struct AttachArgs {
+    /// The tmux session to attach in a new window.
+    pub tmux_session: String,
+    /// Name for the new tmux window (defaults to `TMUX_SESSION`).
+    #[arg(long, value_name = "NAME")]
+    pub window_name: Option<String>,
 }
 
 /// Arguments for `tfmux unbind`.
@@ -615,7 +627,7 @@ mod tests {
 
         match cli.command {
             Command::Send(args) => assert_eq!(args.file.as_deref(), Some("")),
-            Command::Bind(_) | Command::Unbind(_) | Command::Targets(_) => {
+            Command::Bind(_) | Command::Attach(_) | Command::Unbind(_) | Command::Targets(_) => {
                 panic!("expected send command")
             }
         }
@@ -939,6 +951,48 @@ pub fn send(app: &mut App, args: &SendArgs) -> Result<()> {
         app.out,
         "sent {} bytes to \"{}\" ({})",
         sent.bytes, target.name, sent.pane_id
+    )?;
+    Ok(())
+}
+
+/// Handle `tfmux attach`: open a detached tmux session in a new window of the
+/// current tmux client without reading or writing tfmux state.
+///
+/// # Errors
+/// Returns an error when the session/window arguments are blank, the command is
+/// not run from inside tmux, the target tmux session is missing, or tmux cannot
+/// create the new window.
+pub fn attach(app: &mut App, args: &AttachArgs) -> Result<()> {
+    let tmux_session = args.tmux_session.trim();
+    if tmux_session.is_empty() {
+        bail!("tmux session is required");
+    }
+
+    let window_name = match args.window_name.as_deref() {
+        Some(name) => {
+            let name = name.trim();
+            if name.is_empty() {
+                bail!("--window-name requires a non-empty value");
+            }
+            name
+        }
+        None => tmux_session,
+    };
+
+    let in_tmux = (app.env)("TMUX")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if in_tmux.is_none() {
+        bail!("attach requires TMUX; run from inside tmux");
+    }
+
+    let mux = (app.new_mux)()?;
+    mux.has_session(tmux_session)?;
+    mux.attach_session_in_new_window(tmux_session, window_name)?;
+    writeln!(
+        app.out,
+        "attached \"{}\" in new window \"{}\"",
+        tmux_session, window_name
     )?;
     Ok(())
 }
