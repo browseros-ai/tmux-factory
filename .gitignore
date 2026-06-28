@@ -1,0 +1,4 @@
+/target
+
+# Local design-doc symlink that points outside the repo.
+/.llm
