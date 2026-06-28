@@ -7,7 +7,7 @@ use std::fs;
 use std::time::Duration;
 
 use crate::app::App;
-use crate::mux::Mux;
+use crate::mux::{Mux, PaneRef};
 use crate::store::{self, rfc3339, Store};
 use crate::target::{validate_kind, validate_name, validate_role, Target};
 
@@ -31,6 +31,8 @@ pub enum Command {
     Send(SendArgs),
     /// Remove a bound target from a session.
     Unbind(UnbindArgs),
+    /// List bound targets in an existing session.
+    Targets(TargetsArgs),
 }
 
 /// Arguments for `tfmux bind`.
@@ -97,6 +99,17 @@ struct UnbindOutput<'a> {
     removed: bool,
 }
 
+/// Arguments for `tfmux targets`.
+#[derive(Args)]
+pub struct TargetsArgs {
+    /// Override session selection.
+    #[arg(long, value_name = "NAME")]
+    pub session: Option<String>,
+    /// Print targets and status as JSON instead of a text table.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Resolve and read the payload for `tfmux send`.
 ///
 /// Exactly one source must be present: `--text`, `--file`, or `-` for stdin.
@@ -140,6 +153,119 @@ pub fn resolve_send_payload(
 pub struct SendDelivery {
     pub bytes: usize,
     pub pane_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetStatusKind {
+    Live,
+    Stale,
+    Dead,
+}
+
+impl TargetStatusKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            TargetStatusKind::Live => "live",
+            TargetStatusKind::Stale => "stale",
+            TargetStatusKind::Dead => "dead",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PaneSnapshot {
+    pane_id: String,
+    session: String,
+    window: String,
+    pane_index: String,
+}
+
+impl From<PaneRef> for PaneSnapshot {
+    fn from(pane: PaneRef) -> Self {
+        Self {
+            pane_id: pane.pane_id,
+            session: pane.session,
+            window: pane.window,
+            pane_index: pane.pane_index,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetStatusRow {
+    target: Target,
+    status: TargetStatusKind,
+    actual_pane: Option<PaneSnapshot>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TargetStatusJson {
+    name: String,
+    role: String,
+    kind: String,
+    input: String,
+    pane_id: String,
+    session: String,
+    window: String,
+    pane_index: String,
+    bound_at: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_pane: Option<PaneSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl From<&TargetStatusRow> for TargetStatusJson {
+    fn from(row: &TargetStatusRow) -> Self {
+        Self {
+            name: row.target.name.clone(),
+            role: row.target.role.clone(),
+            kind: row.target.kind.clone(),
+            input: row.target.input.clone(),
+            pane_id: row.target.pane_id.clone(),
+            session: row.target.session.clone(),
+            window: row.target.window.clone(),
+            pane_index: row.target.pane_index.clone(),
+            bound_at: row.target.bound_at.clone(),
+            status: row.status.as_str(),
+            actual_pane: row.actual_pane.clone(),
+            error: row.error.clone(),
+        }
+    }
+}
+
+fn inspect_target_status(mux: &dyn Mux, target: &Target) -> TargetStatusRow {
+    match mux.resolve_pane(&target.pane_id) {
+        Ok(pane) => {
+            let status = if pane.pane_id == target.pane_id
+                && pane.session == target.session
+                && pane.window == target.window
+                && pane.pane_index == target.pane_index
+            {
+                TargetStatusKind::Live
+            } else {
+                TargetStatusKind::Stale
+            };
+            let actual_pane = match status {
+                TargetStatusKind::Live => None,
+                TargetStatusKind::Stale | TargetStatusKind::Dead => Some(pane.into()),
+            };
+            TargetStatusRow {
+                target: target.clone(),
+                status,
+                actual_pane,
+                error: None,
+            }
+        }
+        Err(error) => TargetStatusRow {
+            target: target.clone(),
+            status: TargetStatusKind::Dead,
+            actual_pane: None,
+            error: Some(format!("{error:#}")),
+        },
+    }
 }
 
 /// Deliver `payload` to `target` through tmux and verify it was submitted.
@@ -481,7 +607,9 @@ mod tests {
 
         match cli.command {
             Command::Send(args) => assert_eq!(args.file.as_deref(), Some("")),
-            Command::Bind(_) | Command::Unbind(_) => panic!("expected send command"),
+            Command::Bind(_) | Command::Unbind(_) | Command::Targets(_) => {
+                panic!("expected send command")
+            }
         }
     }
 
@@ -620,6 +748,45 @@ mod tests {
         assert!(err.contains("line25 [Pasted text 123]"), "got: {err}");
         assert!(!err.contains("line5\n"), "got: {err}");
         assert_eq!(mux.calls.borrow().enters, vec!["%5", "%5"]);
+    }
+
+    #[test]
+    fn target_status_live_when_resolved_metadata_matches() {
+        let mux = DeliveryMux::new(vec![Ok(pane_ref("%5"))], vec![]);
+        let row = inspect_target_status(&mux, &sample_send_target());
+
+        assert_eq!(row.status, TargetStatusKind::Live);
+        assert_eq!(row.actual_pane, None);
+        assert_eq!(row.error, None);
+        assert_eq!(mux.calls.borrow().resolved, vec!["%5"]);
+    }
+
+    #[test]
+    fn target_status_dead_when_resolve_fails() {
+        let mux = DeliveryMux::new(vec![Err("can't find pane %5".to_string())], vec![]);
+        let row = inspect_target_status(&mux, &sample_send_target());
+
+        assert_eq!(row.status, TargetStatusKind::Dead);
+        assert_eq!(row.actual_pane, None);
+        assert_eq!(row.error.as_deref(), Some("can't find pane %5"));
+    }
+
+    #[test]
+    fn target_status_stale_when_resolved_metadata_differs() {
+        let mux = DeliveryMux::new(vec![Ok(pane_ref_at("%5", "other", "1", "0"))], vec![]);
+        let row = inspect_target_status(&mux, &sample_send_target());
+
+        assert_eq!(row.status, TargetStatusKind::Stale);
+        assert_eq!(
+            row.actual_pane,
+            Some(PaneSnapshot {
+                pane_id: "%5".to_string(),
+                session: "other".to_string(),
+                window: "1".to_string(),
+                pane_index: "0".to_string(),
+            })
+        );
+        assert_eq!(row.error, None);
     }
 }
 
@@ -808,6 +975,79 @@ pub fn unbind(app: &mut App, args: &UnbindArgs) -> Result<()> {
             app.out,
             "unbound \"{}\" from session {}",
             args.name, session_name
+        )?;
+    }
+    Ok(())
+}
+
+/// Handle `tfmux targets`: list bound targets in an existing session and show
+/// whether each stored pane still resolves to the same tmux metadata.
+///
+/// # Errors
+/// Returns an error when no session can be selected, the selected session does
+/// not exist, target files cannot be read, or tmux construction fails.
+pub fn targets(app: &mut App, args: &TargetsArgs) -> Result<()> {
+    let env_session = (app.env)("TFMUX_SESSION");
+    let marker = if has_flag_or_env_session(args.session.as_deref(), env_session.as_deref()) {
+        None
+    } else {
+        store::read_session_marker(&app.cwd)?
+    };
+    let session_name = resolve_send_session_name(
+        args.session.as_deref(),
+        env_session.as_deref(),
+        marker.as_deref(),
+    )?;
+
+    let store = Store::new(app.base_dir.clone());
+    let session_dir = store
+        .find_session_dir(&session_name)?
+        .ok_or_else(|| anyhow!("no tfmux session \"{session_name}\""))?;
+    let stored_targets = store.list_targets(&session_dir)?;
+    if stored_targets.is_empty() {
+        if args.json {
+            writeln!(app.out, "[]")?;
+        }
+        return Ok(());
+    }
+
+    let mux = (app.new_mux)()?;
+    let rows = stored_targets
+        .iter()
+        .map(|target| inspect_target_status(mux.as_ref(), target))
+        .collect::<Vec<_>>();
+    if args.json {
+        let json_rows = rows.iter().map(TargetStatusJson::from).collect::<Vec<_>>();
+        writeln!(app.out, "{}", serde_json::to_string_pretty(&json_rows)?)?;
+    } else {
+        write_targets_table(app, &rows)?;
+    }
+    Ok(())
+}
+
+fn write_targets_table(app: &mut App, rows: &[TargetStatusRow]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        app.out,
+        "{:<10} {:<8} {:<8} {:<6} {:<14} STATUS",
+        "NAME", "ROLE", "KIND", "PANE", "LOCATION"
+    )?;
+    for row in rows {
+        let location = format!(
+            "{}:{}.{}",
+            row.target.session, row.target.window, row.target.pane_index
+        );
+        writeln!(
+            app.out,
+            "{:<10} {:<8} {:<8} {:<6} {:<14} {}",
+            row.target.name,
+            row.target.role,
+            row.target.kind,
+            row.target.pane_id,
+            location,
+            row.status.as_str()
         )?;
     }
     Ok(())

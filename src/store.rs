@@ -121,6 +121,35 @@ impl Store {
             Err(e) => Err(anyhow!("deleting {}: {}", path.display(), e)),
         }
     }
+
+    /// Load all JSON targets from `<session_dir>/targets/`, sorted by name.
+    ///
+    /// Non-JSON files are ignored. Malformed JSON target files are surfaced as
+    /// errors because they represent corrupted tfmux state.
+    pub fn list_targets(&self, session_dir: &Path) -> Result<Vec<Target>> {
+        let targets_dir = session_dir.join("targets");
+        let entries = match fs::read_dir(&targets_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(anyhow!("reading {}: {}", targets_dir.display(), e)),
+        };
+
+        let mut targets = Vec::new();
+        for entry in entries {
+            let entry = entry.context("reading targets dir entry")?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = fs::read_to_string(&path)
+                .with_context(|| format!("reading target {}", path.display()))?;
+            let target: Target = serde_json::from_str(&raw)
+                .with_context(|| format!("decoding target {}", path.display()))?;
+            targets.push(target);
+        }
+        targets.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(targets)
+    }
 }
 
 /// Resolve the session name from the precedence chain
@@ -458,5 +487,58 @@ mod tests {
             fs::read_to_string(dir.join("agent1.json")).unwrap(),
             "outside target dir"
         );
+    }
+
+    // ---- list_targets ----
+
+    #[test]
+    fn list_targets_missing_targets_dir_is_empty() {
+        let base = tempfile::tempdir().unwrap();
+        let store = Store::new(base.path().to_path_buf());
+        let dir = store.create_session("demo", fixed_now()).unwrap();
+
+        assert_eq!(store.list_targets(&dir).unwrap(), Vec::<Target>::new());
+    }
+
+    #[test]
+    fn list_targets_reads_json_files_sorted_by_name() {
+        let base = tempfile::tempdir().unwrap();
+        let store = Store::new(base.path().to_path_buf());
+        let dir = store.create_session("demo", fixed_now()).unwrap();
+
+        let mut beta = sample_target();
+        beta.name = "beta".to_string();
+        let mut alpha = sample_target();
+        alpha.name = "alpha".to_string();
+        store.save_target(&dir, &beta).unwrap();
+        store.save_target(&dir, &alpha).unwrap();
+
+        let listed = store.list_targets(&dir).unwrap();
+        assert_eq!(listed, vec![alpha, beta]);
+    }
+
+    #[test]
+    fn list_targets_ignores_non_json_junk() {
+        let base = tempfile::tempdir().unwrap();
+        let store = Store::new(base.path().to_path_buf());
+        let dir = store.create_session("demo", fixed_now()).unwrap();
+        let target = sample_target();
+        store.save_target(&dir, &target).unwrap();
+        fs::write(dir.join("targets/README.txt"), "not a target").unwrap();
+
+        assert_eq!(store.list_targets(&dir).unwrap(), vec![target]);
+    }
+
+    #[test]
+    fn list_targets_surfaces_malformed_json_files() {
+        let base = tempfile::tempdir().unwrap();
+        let store = Store::new(base.path().to_path_buf());
+        let dir = store.create_session("demo", fixed_now()).unwrap();
+        fs::create_dir_all(dir.join("targets")).unwrap();
+        fs::write(dir.join("targets/broken.json"), "{not json").unwrap();
+
+        let err = store.list_targets(&dir).unwrap_err().to_string();
+        assert!(err.contains("decoding target"), "got: {err}");
+        assert!(err.contains("broken.json"), "got: {err}");
     }
 }

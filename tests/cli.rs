@@ -38,12 +38,22 @@ struct FakeMux {
     calls: Rc<RefCell<MuxCalls>>,
     pane: PaneRef,
     err: Option<String>,
+    resolve_overrides: HashMap<String, std::result::Result<PaneRef, String>>,
     captures: Rc<RefCell<VecDeque<String>>>,
 }
 
 impl Mux for FakeMux {
     fn resolve_pane(&self, target: &str) -> anyhow::Result<PaneRef> {
         self.calls.borrow_mut().resolved.push(target.to_string());
+        if let Some(result) = self.resolve_overrides.get(target) {
+            return match result {
+                Ok(pane) => Ok(PaneRef {
+                    input: target.to_string(),
+                    ..pane.clone()
+                }),
+                Err(err) => anyhow::bail!("{err}"),
+            };
+        }
         if let Some(e) = &self.err {
             anyhow::bail!("{e}");
         }
@@ -95,6 +105,7 @@ struct Scenario {
     env: HashMap<String, String>,
     pane: PaneRef,
     resolve_err: Option<String>,
+    resolve_overrides: HashMap<String, std::result::Result<PaneRef, String>>,
     stdin: String,
     buffer_name: String,
     captures: Rc<RefCell<VecDeque<String>>>,
@@ -116,6 +127,7 @@ impl Scenario {
                 pane_index: "0".into(),
             },
             resolve_err: None,
+            resolve_overrides: HashMap::new(),
             stdin: String::new(),
             buffer_name: "buf-test".to_string(),
             captures: Rc::new(RefCell::new(VecDeque::from(["submitted\n".to_string()]))),
@@ -142,6 +154,15 @@ impl Scenario {
 
     fn resolve_err(mut self, msg: &str) -> Self {
         self.resolve_err = Some(msg.to_string());
+        self
+    }
+
+    fn resolve_override(
+        mut self,
+        target: &str,
+        result: std::result::Result<PaneRef, String>,
+    ) -> Self {
+        self.resolve_overrides.insert(target.to_string(), result);
         self
     }
 
@@ -214,19 +235,25 @@ impl Scenario {
     }
 
     fn save_target(&self, session: &str, name: &str) {
+        self.save_target_record(
+            session,
+            Target {
+                name: name.to_string(),
+                role: "agent".to_string(),
+                kind: "generic".to_string(),
+                input: "sess:1.0".to_string(),
+                pane_id: "%5".to_string(),
+                session: "sess".to_string(),
+                window: "1".to_string(),
+                pane_index: "0".to_string(),
+                bound_at: "2026-06-28T12:00:00Z".to_string(),
+            },
+        );
+    }
+
+    fn save_target_record(&self, session: &str, target: Target) {
         let store = Store::new(self.home().to_path_buf());
         let dir = store.create_session(session, fixed_now()).unwrap();
-        let target = Target {
-            name: name.to_string(),
-            role: "agent".to_string(),
-            kind: "generic".to_string(),
-            input: "sess:1.0".to_string(),
-            pane_id: "%5".to_string(),
-            session: "sess".to_string(),
-            window: "1".to_string(),
-            pane_index: "0".to_string(),
-            bound_at: "2026-06-28T12:00:00Z".to_string(),
-        };
         store.save_target(&dir, &target).unwrap();
     }
 
@@ -243,6 +270,7 @@ impl Scenario {
         let calls = self.calls.clone();
         let pane = self.pane.clone();
         let err = self.resolve_err.clone();
+        let resolve_overrides = self.resolve_overrides.clone();
         let captures = self.captures.clone();
         let new_mux = move || -> anyhow::Result<Box<dyn Mux>> {
             calls.borrow_mut().built += 1;
@@ -250,6 +278,7 @@ impl Scenario {
                 calls: calls.clone(),
                 pane: pane.clone(),
                 err: err.clone(),
+                resolve_overrides: resolve_overrides.clone(),
                 captures: captures.clone(),
             }))
         };
@@ -277,6 +306,38 @@ impl Scenario {
         };
         let result = tfmux::run(&mut app, cli);
         (result, String::from_utf8(out).unwrap())
+    }
+}
+
+fn stored_target(
+    name: &str,
+    role: &str,
+    kind: &str,
+    pane_id: &str,
+    session: &str,
+    window: &str,
+    pane_index: &str,
+) -> Target {
+    Target {
+        name: name.to_string(),
+        role: role.to_string(),
+        kind: kind.to_string(),
+        input: format!("{session}:{window}.{pane_index}"),
+        pane_id: pane_id.to_string(),
+        session: session.to_string(),
+        window: window.to_string(),
+        pane_index: pane_index.to_string(),
+        bound_at: "2026-06-28T12:00:00Z".to_string(),
+    }
+}
+
+fn pane_ref_at(pane_id: &str, session: &str, window: &str, pane_index: &str) -> PaneRef {
+    PaneRef {
+        input: pane_id.to_string(),
+        pane_id: pane_id.to_string(),
+        session: session.to_string(),
+        window: window.to_string(),
+        pane_index: pane_index.to_string(),
     }
 }
 
@@ -875,4 +936,135 @@ fn unbind_invalid_name_errors_before_any_write() {
     assert_eq!(s.built(), 0);
     assert_eq!(s.home_entry_count(), 0);
     assert!(!s.home().join("current").exists());
+}
+
+#[test]
+fn targets_session_prints_table_for_bound_targets() {
+    let s = Scenario::new()
+        .resolve_override("%5", Ok(pane_ref_at("%5", "work", "1", "0")))
+        .resolve_override("%3", Err("can't find pane %3".to_string()));
+    s.save_target_record(
+        "demo",
+        stored_target("mediator", "mediator", "codex", "%3", "work", "0", "0"),
+    );
+    s.save_target_record(
+        "demo",
+        stored_target("agent1", "agent", "claude", "%5", "work", "1", "0"),
+    );
+
+    let (result, stdout) = s.run(&["tfmux", "targets", "--session", "demo"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(
+        stdout,
+        concat!(
+            "NAME       ROLE     KIND     PANE   LOCATION       STATUS\n",
+            "agent1     agent    claude   %5     work:1.0       live\n",
+            "mediator   mediator codex    %3     work:0.0       dead\n",
+        )
+    );
+    assert_eq!(s.resolved(), vec!["%5".to_string(), "%3".to_string()]);
+}
+
+#[test]
+fn targets_json_session_prints_stable_valid_json() {
+    let s = Scenario::new()
+        .resolve_override("%5", Ok(pane_ref_at("%5", "work", "1", "0")))
+        .resolve_override("%6", Ok(pane_ref_at("%7", "other", "2", "1")))
+        .resolve_override("%3", Err("can't find pane %3".to_string()));
+    s.save_target_record(
+        "demo",
+        stored_target("mediator", "mediator", "codex", "%3", "work", "0", "0"),
+    );
+    s.save_target_record(
+        "demo",
+        stored_target("agent2", "agent", "generic", "%6", "work", "2", "1"),
+    );
+    s.save_target_record(
+        "demo",
+        stored_target("agent1", "agent", "claude", "%5", "work", "1", "0"),
+    );
+
+    let (result, stdout) = s.run(&["tfmux", "targets", "--json", "--session", "demo"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    let rows: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["name"], "agent1");
+    assert_eq!(rows[0]["status"], "live");
+    assert!(rows[0].get("actual_pane").is_none());
+    assert!(rows[0].get("error").is_none());
+    assert_eq!(rows[1]["name"], "agent2");
+    assert_eq!(rows[1]["status"], "stale");
+    assert_eq!(rows[1]["actual_pane"]["pane_id"], "%7");
+    assert_eq!(rows[1]["actual_pane"]["session"], "other");
+    assert_eq!(rows[2]["name"], "mediator");
+    assert_eq!(rows[2]["status"], "dead");
+    assert_eq!(rows[2]["error"], "can't find pane %3");
+}
+
+#[test]
+fn targets_resolves_session_from_env_var() {
+    let s = Scenario::new()
+        .env("TFMUX_SESSION", "envdemo")
+        .resolve_override("%5", Ok(pane_ref_at("%5", "sess", "1", "0")));
+    s.save_target("envdemo", "agent1");
+
+    let (result, stdout) = s.run(&["tfmux", "targets"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert!(stdout.contains("agent1"), "stdout: {stdout}");
+}
+
+#[test]
+fn targets_resolves_session_from_local_marker() {
+    let s = Scenario::new()
+        .marker("markerdemo")
+        .resolve_override("%5", Ok(pane_ref_at("%5", "sess", "1", "0")));
+    s.save_target("markerdemo", "agent1");
+
+    let (result, stdout) = s.run(&["tfmux", "targets"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert!(stdout.contains("agent1"), "stdout: {stdout}");
+}
+
+#[test]
+fn targets_without_any_session_selection_errors_without_creating_state() {
+    let s = Scenario::new();
+
+    let (result, _) = s.run(&["tfmux", "targets"]);
+
+    let err = result.unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "no tfmux session selected; pass --session NAME, set TFMUX_SESSION, or add .llm/tfmux-session"
+    );
+    assert_eq!(s.built(), 0);
+    assert_eq!(s.home_entry_count(), 0);
+}
+
+#[test]
+fn targets_missing_session_errors_without_creating_state() {
+    let s = Scenario::new();
+
+    let (result, _) = s.run(&["tfmux", "targets", "--session", "demo"]);
+
+    let err = result.unwrap_err().to_string();
+    assert_eq!(err, "no tfmux session \"demo\"");
+    assert_eq!(s.built(), 0);
+    assert_eq!(s.home_entry_count(), 0);
+}
+
+#[test]
+fn targets_does_not_create_global_current_pointer() {
+    let s = Scenario::new().resolve_override("%5", Ok(pane_ref_at("%5", "sess", "1", "0")));
+    s.save_target("demo", "agent1");
+
+    let (result, _) = s.run(&["tfmux", "targets", "--session", "demo"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert!(!s.home().join("current").exists());
+    assert_eq!(s.home_entry_count(), 1);
 }

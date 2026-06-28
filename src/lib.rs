@@ -15,5 +15,6 @@ pub fn run(app: &mut App, cli: Cli) -> Result<()> {
         Command::Bind(args) => cli::bind(app, &args),
         Command::Send(args) => cli::send(app, &args),
         Command::Unbind(args) => cli::unbind(app, &args),
+        Command::Targets(args) => cli::targets(app, &args),
     }
 }
