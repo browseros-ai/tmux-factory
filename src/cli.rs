@@ -963,15 +963,14 @@ pub fn send(app: &mut App, args: &SendArgs) -> Result<()> {
 /// not run from inside tmux, the target tmux session is missing, or tmux cannot
 /// create the new window.
 pub fn attach(app: &mut App, args: &AttachArgs) -> Result<()> {
-    let tmux_session = args.tmux_session.trim();
-    if tmux_session.is_empty() {
+    let tmux_session = args.tmux_session.as_str();
+    if tmux_session.trim().is_empty() {
         bail!("tmux session is required");
     }
 
     let window_name = match args.window_name.as_deref() {
         Some(name) => {
-            let name = name.trim();
-            if name.is_empty() {
+            if name.trim().is_empty() {
                 bail!("--window-name requires a non-empty value");
             }
             name

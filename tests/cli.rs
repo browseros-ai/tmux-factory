@@ -423,6 +423,31 @@ fn attach_custom_window_name() {
 }
 
 #[test]
+fn attach_preserves_raw_session_and_window_names_after_blank_validation() {
+    let s = Scenario::new().env("TMUX", "/tmp/tmux-501/default,1234,0");
+
+    let (result, stdout) = s.run(&[
+        "tfmux",
+        "attach",
+        " worker ",
+        "--window-name",
+        " agent worker ",
+    ]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(
+        stdout,
+        "attached \" worker \" in new window \" agent worker \"\n"
+    );
+    assert_eq!(s.has_sessions(), vec![" worker ".to_string()]);
+    assert_eq!(
+        s.attached_windows(),
+        vec![(" worker ".to_string(), " agent worker ".to_string())]
+    );
+    assert_eq!(s.home_entry_count(), 0);
+}
+
+#[test]
 fn attach_outside_tmux_errors_before_building_mux_or_writing_state() {
     let s = Scenario::new();
 
@@ -433,6 +458,24 @@ fn attach_outside_tmux_errors_before_building_mux_or_writing_state() {
     assert_eq!(s.built(), 0);
     assert!(s.has_sessions().is_empty());
     assert_eq!(s.home_entry_count(), 0);
+}
+
+#[test]
+fn attach_real_binary_outside_tmux_does_not_require_home() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tfmux"))
+        .args(["attach", "worker"])
+        .env_remove("HOME")
+        .env_remove("TFMUX_HOME")
+        .env_remove("TMUX")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "error: attach requires TMUX; run from inside tmux\n"
+    );
 }
 
 #[test]
