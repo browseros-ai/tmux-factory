@@ -39,6 +39,12 @@ pub trait Mux {
 
     /// Capture text from `pane_id`, optionally including scrollback lines.
     fn capture_pane(&self, pane_id: &str, scrollback: i32) -> Result<String>;
+
+    /// Check that a tmux session exists.
+    fn has_session(&self, session: &str) -> Result<()>;
+
+    /// Open a new tmux window that attaches to `session` with `TMUX` unset.
+    fn attach_session_in_new_window(&self, session: &str, window_name: &str) -> Result<()>;
 }
 
 /// Real tmux backend that shells out to the `tmux` binary.
@@ -153,6 +159,35 @@ impl Mux for Tmux {
             self.run(&["capture-pane", "-p", "-t", pane_id])
         }
     }
+
+    fn has_session(&self, session: &str) -> Result<()> {
+        self.run(&["has-session", "-t", session])?;
+        Ok(())
+    }
+
+    fn attach_session_in_new_window(&self, session: &str, window_name: &str) -> Result<()> {
+        let command = format!(
+            "env -u TMUX tmux attach-session -t {}",
+            shell_quote(session)
+        );
+        self.run(&["new-window", "-n", window_name, &command])?;
+        Ok(())
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.chars().all(|ch| {
+        ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                '@' | '%' | '_' | '+' | '=' | ':' | ',' | '.' | '/' | '-'
+            )
+    }) {
+        return value.to_string();
+    }
+
+    let escaped = value.replace('\'', "'\\''");
+    format!("'{escaped}'")
 }
 
 /// Parse the tab-separated `display-message` output into a `PaneRef`.
@@ -320,6 +355,76 @@ mod tests {
         assert_eq!(output, "captured\n");
         let args = recorded_args(dir.path());
         assert_eq!(args, vec!["capture-pane", "-p", "-t", "%5", "-S", "-80"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn has_session_issues_exact_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_tmux(dir.path(), "");
+        let tmux = Tmux::new(bin);
+
+        tmux.has_session("worker").unwrap();
+
+        let args = recorded_args(dir.path());
+        assert_eq!(args, vec!["has-session", "-t", "worker"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn has_session_surfaces_command_failure_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_failing_tmux(dir.path(), "no such session: worker");
+        let tmux = Tmux::new(bin);
+
+        let err = tmux.has_session("worker").unwrap_err().to_string();
+
+        assert!(err.contains("tmux has-session failed"), "got: {err}");
+        assert!(err.contains("no such session: worker"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attach_session_in_new_window_issues_exact_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_tmux(dir.path(), "");
+        let tmux = Tmux::new(bin);
+
+        tmux.attach_session_in_new_window("worker", "agent-worker")
+            .unwrap();
+
+        let args = recorded_args(dir.path());
+        assert_eq!(
+            args,
+            vec![
+                "new-window",
+                "-n",
+                "agent-worker",
+                "env -u TMUX tmux attach-session -t worker",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attach_session_quotes_nested_session_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_tmux(dir.path(), "");
+        let tmux = Tmux::new(bin);
+
+        tmux.attach_session_in_new_window("work session's $main", "agent")
+            .unwrap();
+
+        let args = recorded_args(dir.path());
+        assert_eq!(
+            args,
+            vec![
+                "new-window",
+                "-n",
+                "agent",
+                "env -u TMUX tmux attach-session -t 'work session'\\''s $main'",
+            ]
+        );
     }
 
     #[cfg(unix)]

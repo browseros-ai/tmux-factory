@@ -31,6 +31,8 @@ struct MuxCalls {
     deleted: Vec<String>,
     enters: Vec<String>,
     captured: Vec<(String, i32)>,
+    has_sessions: Vec<String>,
+    attached_windows: Vec<(String, String)>,
 }
 
 /// Fake tmux: records each resolve call and returns a scripted pane (or error).
@@ -95,6 +97,22 @@ impl Mux for FakeMux {
             .captured
             .push((pane_id.to_string(), scrollback));
         Ok(self.captures.borrow_mut().pop_front().unwrap_or_default())
+    }
+
+    fn has_session(&self, session: &str) -> anyhow::Result<()> {
+        self.calls
+            .borrow_mut()
+            .has_sessions
+            .push(session.to_string());
+        Ok(())
+    }
+
+    fn attach_session_in_new_window(&self, session: &str, window_name: &str) -> anyhow::Result<()> {
+        self.calls
+            .borrow_mut()
+            .attached_windows
+            .push((session.to_string(), window_name.to_string()));
+        Ok(())
     }
 }
 

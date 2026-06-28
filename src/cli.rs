@@ -507,6 +507,14 @@ mod tests {
                 .push((pane_id.to_string(), scrollback));
             Ok(self.captures.borrow_mut().pop_front().unwrap_or_default())
         }
+
+        fn has_session(&self, _session: &str) -> Result<()> {
+            anyhow::bail!("unexpected has_session call")
+        }
+
+        fn attach_session_in_new_window(&self, _session: &str, _window_name: &str) -> Result<()> {
+            anyhow::bail!("unexpected attach_session_in_new_window call")
+        }
     }
 
     #[test]
