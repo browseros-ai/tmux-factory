@@ -1,6 +1,26 @@
 //! Pure target data and validation. No I/O lives here.
 
 use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
+
+/// A named, bound tmux pane. This is the only per-target state tfmux persists.
+///
+/// Field order is the on-disk JSON order and is intentional (see design §4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Target {
+    pub name: String,
+    pub role: String,
+    pub kind: String,
+    /// The tmux target string the user passed (e.g. `%5` or `sess:1.0`).
+    pub input: String,
+    /// Canonical `%N` pane id from tmux.
+    pub pane_id: String,
+    pub session: String,
+    pub window: String,
+    pub pane_index: String,
+    /// RFC3339 UTC timestamp of the bind.
+    pub bound_at: String,
+}
 
 /// Validate a target or session name as a single path-safe token.
 ///
