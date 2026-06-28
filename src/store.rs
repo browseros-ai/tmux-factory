@@ -31,6 +31,7 @@ pub struct Store {
 }
 
 impl Store {
+    /// Create a store rooted at `base_dir` (`$TFMUX_HOME` or `~/.tfmux`).
     pub fn new(base_dir: PathBuf) -> Self {
         Self { base_dir }
     }

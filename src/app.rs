@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use crate::mux::Mux;
 
+/// Dependency-injection context threaded into every command handler.
 pub struct App<'a> {
     /// `$TFMUX_HOME` or `~/.tfmux`; a tempdir in tests.
     pub base_dir: PathBuf,

@@ -22,6 +22,7 @@ pub struct PaneRef {
 
 /// Seam over the tmux multiplexer.
 pub trait Mux {
+    /// Resolve a tmux target string to canonical pane information.
     fn resolve_pane(&self, target: &str) -> Result<PaneRef>;
 }
 

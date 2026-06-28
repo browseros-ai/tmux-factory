@@ -7,6 +7,7 @@ use crate::app::App;
 use crate::store::{self, rfc3339, Store};
 use crate::target::{validate_kind, validate_name, validate_role, Target};
 
+/// Parsed top-level CLI invocation.
 #[derive(Parser)]
 #[command(
     name = "tfmux",
@@ -18,12 +19,14 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// Top-level subcommands.
 #[derive(Subcommand)]
 pub enum Command {
     /// Bind a named target to a canonical tmux pane.
     Bind(BindArgs),
 }
 
+/// Arguments for `tfmux bind`.
 #[derive(Args)]
 pub struct BindArgs {
     /// Target name (a single path-safe token).
@@ -48,6 +51,13 @@ pub struct BindArgs {
     pub json: bool,
 }
 
+/// Handle `tfmux bind`: resolve the session and tmux pane, then persist the
+/// target. Validation and argument errors fail before any state is written.
+///
+/// # Errors
+/// Returns an error on an invalid name/role/kind, when not exactly one of
+/// `--here`/`--tmux` is given, when no session name resolves, or when tmux
+/// cannot resolve the pane.
 pub fn bind(app: &mut App, args: &BindArgs) -> Result<()> {
     validate_name(&args.name)?;
     validate_role(&args.role)?;
