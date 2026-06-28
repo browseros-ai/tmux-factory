@@ -1,4 +1,5 @@
 use std::io::{self, Read};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -6,11 +7,14 @@ use chrono::Utc;
 use clap::Parser;
 
 use tfmux::app::{base_dir_from_env, App};
-use tfmux::cli::Cli;
+use tfmux::cli::{Cli, Command};
 use tfmux::mux::{Mux, Tmux};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if matches!(&cli.command, Command::Attach(_)) {
+        return run_attach(cli);
+    }
 
     let base_dir = match base_dir_from_env() {
         Ok(dir) => dir,
@@ -43,6 +47,33 @@ fn main() -> ExitCode {
         base_dir,
         env: &env_fn,
         cwd,
+        now: &now_fn,
+        new_mux: &new_mux,
+        read_stdin: &read_stdin,
+        new_buffer_name: &new_buffer_name,
+        sleep: &sleep,
+        out: &mut out,
+    };
+
+    match tfmux::run(&mut app, cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(e),
+    }
+}
+
+fn run_attach(cli: Cli) -> ExitCode {
+    let env_fn = |k: &str| std::env::var(k).ok();
+    let now_fn = || Utc::now();
+    let new_mux = || -> anyhow::Result<Box<dyn Mux>> { Ok(Box::new(Tmux::from_env()?)) };
+    let read_stdin = || -> anyhow::Result<String> { Ok(String::new()) };
+    let new_buffer_name = || -> String { String::new() };
+    let sleep = |_duration| {};
+    let mut out = io::stdout();
+
+    let mut app = App {
+        base_dir: PathBuf::new(),
+        env: &env_fn,
+        cwd: PathBuf::new(),
         now: &now_fn,
         new_mux: &new_mux,
         read_stdin: &read_stdin,

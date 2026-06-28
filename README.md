@@ -13,8 +13,10 @@ report back.
   Enter, then verifies the paste actually landed.
 - **Lets agents report back** by sending to the `mediator` target — the "I'm
   done" callback is just `tfmux send mediator --text "done"`, no special command.
+- **Attaches detached tmux sessions** in a new window of the current tmux client
+  for operator convenience.
 - **Keeps state under `~/.tfmux`** — one `session.json` per session, one JSON
-  file per bound target.
+  file per bound target. `attach` does not read or write this state.
 - **No transcript, inbox, or dashboard.** It is a transport, nothing more.
 
 ## Install / build
@@ -33,7 +35,7 @@ session" — session identity travels with the pane, so many factories can run a
 once.
 
 - **State root:** `$TFMUX_HOME` if set, otherwise `~/.tfmux`.
-- **Session selection precedence** (used by every command):
+- **Session selection precedence** (used by stateful target commands):
   1. `--session NAME` flag
   2. `TFMUX_SESSION` environment variable
   3. `.llm/tfmux-session` marker (first line) in the current directory
@@ -43,8 +45,8 @@ once.
 
 ## Commands
 
-Names (targets and sessions) must be single path-safe tokens. On error, tfmux
-prints `error: <msg>` to stderr and exits 1.
+Tfmux target names and tfmux state session names must be single path-safe tokens.
+On error, tfmux prints `error: <msg>` to stderr and exits 1.
 
 ### `tfmux bind <NAME>`
 
@@ -82,6 +84,24 @@ Pass exactly one input source: `--text`, `--file`, or `-` (stdin). If the pane
 is gone or no longer resolves to the same id, `send` fails and tells you to
 rebind.
 
+### `tfmux attach <TMUX_SESSION>`
+
+Attach a detached tmux session inside a new window of the current tmux client.
+This is independent of tfmux factory state: it does not read `TFMUX_SESSION`,
+`.llm/tfmux-session`, or `~/.tfmux`.
+
+```bash
+tfmux attach worker
+# -> attached "worker" in new window "worker"
+
+tfmux attach worker --window-name agent-worker
+# -> attached "worker" in new window "agent-worker"
+```
+
+Run it from inside tmux. `attach` first checks `tmux has-session -t
+<TMUX_SESSION>`, then opens a new window that runs `env -u TMUX tmux
+attach-session -t <TMUX_SESSION>`.
+
 ### `tfmux targets`
 
 List bound targets in the session and re-check each pane's live/stale/dead
@@ -107,7 +127,8 @@ tfmux unbind agent1
 
 Add `--json` for a stable summary.
 
-Every command accepts `--session NAME` to override session selection.
+Stateful target commands accept `--session NAME` to override session selection.
+`attach` takes a raw tmux session name instead.
 
 ## Minimal workflow
 

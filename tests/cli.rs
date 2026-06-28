@@ -31,6 +31,8 @@ struct MuxCalls {
     deleted: Vec<String>,
     enters: Vec<String>,
     captured: Vec<(String, i32)>,
+    has_sessions: Vec<String>,
+    attached_windows: Vec<(String, String)>,
 }
 
 /// Fake tmux: records each resolve call and returns a scripted pane (or error).
@@ -38,6 +40,7 @@ struct FakeMux {
     calls: Rc<RefCell<MuxCalls>>,
     pane: PaneRef,
     err: Option<String>,
+    has_session_err: Option<String>,
     resolve_overrides: HashMap<String, std::result::Result<PaneRef, String>>,
     captures: Rc<RefCell<VecDeque<String>>>,
 }
@@ -96,6 +99,25 @@ impl Mux for FakeMux {
             .push((pane_id.to_string(), scrollback));
         Ok(self.captures.borrow_mut().pop_front().unwrap_or_default())
     }
+
+    fn has_session(&self, session: &str) -> anyhow::Result<()> {
+        self.calls
+            .borrow_mut()
+            .has_sessions
+            .push(session.to_string());
+        if let Some(err) = &self.has_session_err {
+            anyhow::bail!("{err}");
+        }
+        Ok(())
+    }
+
+    fn attach_session_in_new_window(&self, session: &str, window_name: &str) -> anyhow::Result<()> {
+        self.calls
+            .borrow_mut()
+            .attached_windows
+            .push((session.to_string(), window_name.to_string()));
+        Ok(())
+    }
 }
 
 /// Builder + driver for a single bind invocation.
@@ -105,6 +127,7 @@ struct Scenario {
     env: HashMap<String, String>,
     pane: PaneRef,
     resolve_err: Option<String>,
+    has_session_err: Option<String>,
     resolve_overrides: HashMap<String, std::result::Result<PaneRef, String>>,
     stdin: String,
     buffer_name: String,
@@ -127,6 +150,7 @@ impl Scenario {
                 pane_index: "0".into(),
             },
             resolve_err: None,
+            has_session_err: None,
             resolve_overrides: HashMap::new(),
             stdin: String::new(),
             buffer_name: "buf-test".to_string(),
@@ -154,6 +178,11 @@ impl Scenario {
 
     fn resolve_err(mut self, msg: &str) -> Self {
         self.resolve_err = Some(msg.to_string());
+        self
+    }
+
+    fn has_session_err(mut self, msg: &str) -> Self {
+        self.has_session_err = Some(msg.to_string());
         self
     }
 
@@ -203,6 +232,14 @@ impl Scenario {
 
     fn captured(&self) -> Vec<(String, i32)> {
         self.calls.borrow().captured.clone()
+    }
+
+    fn has_sessions(&self) -> Vec<String> {
+        self.calls.borrow().has_sessions.clone()
+    }
+
+    fn attached_windows(&self) -> Vec<(String, String)> {
+        self.calls.borrow().attached_windows.clone()
     }
 
     fn sleeps(&self) -> u32 {
@@ -270,6 +307,7 @@ impl Scenario {
         let calls = self.calls.clone();
         let pane = self.pane.clone();
         let err = self.resolve_err.clone();
+        let has_session_err = self.has_session_err.clone();
         let resolve_overrides = self.resolve_overrides.clone();
         let captures = self.captures.clone();
         let new_mux = move || -> anyhow::Result<Box<dyn Mux>> {
@@ -278,6 +316,7 @@ impl Scenario {
                 calls: calls.clone(),
                 pane: pane.clone(),
                 err: err.clone(),
+                has_session_err: has_session_err.clone(),
                 resolve_overrides: resolve_overrides.clone(),
                 captures: captures.clone(),
             }))
@@ -339,6 +378,146 @@ fn pane_ref_at(pane_id: &str, session: &str, window: &str, pane_index: &str) -> 
         window: window.to_string(),
         pane_index: pane_index.to_string(),
     }
+}
+
+#[test]
+fn attach_inside_tmux_defaults_window_name_to_session_without_state() {
+    let s = Scenario::new()
+        .env("TMUX", "/tmp/tmux-501/default,1234,0")
+        .env("TFMUX_SESSION", "ignored");
+    std::fs::create_dir_all(s.cwd.path().join(".llm/tfmux-session")).unwrap();
+
+    let (result, stdout) = s.run(&["tfmux", "attach", "worker"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "attached \"worker\" in new window \"worker\"\n");
+    assert_eq!(s.built(), 1);
+    assert_eq!(s.has_sessions(), vec!["worker".to_string()]);
+    assert_eq!(
+        s.attached_windows(),
+        vec![("worker".to_string(), "worker".to_string())]
+    );
+    assert!(s.resolved().is_empty());
+    assert!(s.loaded().is_empty());
+    assert!(!s.home().join("current").exists());
+    assert_eq!(s.home_entry_count(), 0);
+}
+
+#[test]
+fn attach_custom_window_name() {
+    let s = Scenario::new().env("TMUX", "/tmp/tmux-501/default,1234,0");
+
+    let (result, stdout) = s.run(&["tfmux", "attach", "worker", "--window-name", "agent-worker"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(
+        stdout,
+        "attached \"worker\" in new window \"agent-worker\"\n"
+    );
+    assert_eq!(s.has_sessions(), vec!["worker".to_string()]);
+    assert_eq!(
+        s.attached_windows(),
+        vec![("worker".to_string(), "agent-worker".to_string())]
+    );
+    assert_eq!(s.home_entry_count(), 0);
+}
+
+#[test]
+fn attach_preserves_raw_session_and_window_names_after_blank_validation() {
+    let s = Scenario::new().env("TMUX", "/tmp/tmux-501/default,1234,0");
+
+    let (result, stdout) = s.run(&[
+        "tfmux",
+        "attach",
+        " worker ",
+        "--window-name",
+        " agent worker ",
+    ]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(
+        stdout,
+        "attached \" worker \" in new window \" agent worker \"\n"
+    );
+    assert_eq!(s.has_sessions(), vec![" worker ".to_string()]);
+    assert_eq!(
+        s.attached_windows(),
+        vec![(" worker ".to_string(), " agent worker ".to_string())]
+    );
+    assert_eq!(s.home_entry_count(), 0);
+}
+
+#[test]
+fn attach_outside_tmux_errors_before_building_mux_or_writing_state() {
+    let s = Scenario::new();
+
+    let (result, _) = s.run(&["tfmux", "attach", "worker"]);
+
+    let err = result.unwrap_err().to_string();
+    assert_eq!(err, "attach requires TMUX; run from inside tmux");
+    assert_eq!(s.built(), 0);
+    assert!(s.has_sessions().is_empty());
+    assert_eq!(s.home_entry_count(), 0);
+}
+
+#[test]
+fn attach_real_binary_outside_tmux_does_not_require_home() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tfmux"))
+        .args(["attach", "worker"])
+        .env_remove("HOME")
+        .env_remove("TFMUX_HOME")
+        .env_remove("TMUX")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "error: attach requires TMUX; run from inside tmux\n"
+    );
+}
+
+#[test]
+fn attach_blank_session_errors_before_building_mux_or_writing_state() {
+    let s = Scenario::new().env("TMUX", "/tmp/tmux-501/default,1234,0");
+
+    let (result, _) = s.run(&["tfmux", "attach", "", "--window-name", "worker"]);
+
+    let err = result.unwrap_err().to_string();
+    assert_eq!(err, "tmux session is required");
+    assert_eq!(s.built(), 0);
+    assert!(s.has_sessions().is_empty());
+    assert_eq!(s.home_entry_count(), 0);
+}
+
+#[test]
+fn attach_blank_window_name_errors_before_building_mux_or_writing_state() {
+    let s = Scenario::new().env("TMUX", "/tmp/tmux-501/default,1234,0");
+
+    let (result, _) = s.run(&["tfmux", "attach", "worker", "--window-name", "   "]);
+
+    let err = result.unwrap_err().to_string();
+    assert_eq!(err, "--window-name requires a non-empty value");
+    assert_eq!(s.built(), 0);
+    assert!(s.has_sessions().is_empty());
+    assert_eq!(s.home_entry_count(), 0);
+}
+
+#[test]
+fn attach_missing_tmux_session_propagates_has_session_failure() {
+    let s = Scenario::new()
+        .env("TMUX", "/tmp/tmux-501/default,1234,0")
+        .has_session_err("tmux has-session failed: no such session: worker");
+
+    let (result, _) = s.run(&["tfmux", "attach", "worker"]);
+
+    let err = result.unwrap_err().to_string();
+    assert_eq!(err, "tmux has-session failed: no such session: worker");
+    assert_eq!(s.built(), 1);
+    assert_eq!(s.has_sessions(), vec!["worker".to_string()]);
+    assert!(s.attached_windows().is_empty());
+    assert_eq!(s.home_entry_count(), 0);
 }
 
 #[test]
