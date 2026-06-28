@@ -16,11 +16,7 @@ const SEND_CAPTURE_SCROLLBACK: i32 = 80;
 
 /// Parsed top-level CLI invocation.
 #[derive(Parser)]
-#[command(
-    name = "tfmux",
-    version,
-    about = "Drive a tmux agent fleet."
-)]
+#[command(name = "tfmux", version, about = "Drive a tmux agent fleet.")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

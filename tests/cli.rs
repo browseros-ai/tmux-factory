@@ -794,14 +794,7 @@ fn unbind_json_prints_stable_payload() {
     let s = Scenario::new();
     s.save_target("demo", "agent1");
 
-    let (result, stdout) = s.run(&[
-        "tfmux",
-        "unbind",
-        "agent1",
-        "--session",
-        "demo",
-        "--json",
-    ]);
+    let (result, stdout) = s.run(&["tfmux", "unbind", "agent1", "--session", "demo", "--json"]);
 
     assert!(result.is_ok(), "{:?}", result.err());
     let printed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
