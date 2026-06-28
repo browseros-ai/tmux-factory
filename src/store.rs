@@ -169,7 +169,8 @@ mod tests {
 
     #[test]
     fn session_flag_wins_over_env_and_marker() {
-        let got = resolve_session_name(Some("flagsess"), Some("envsess"), Some("markersess")).unwrap();
+        let got =
+            resolve_session_name(Some("flagsess"), Some("envsess"), Some("markersess")).unwrap();
         assert_eq!(got, "flagsess");
     }
 
@@ -193,7 +194,9 @@ mod tests {
 
     #[test]
     fn session_none_errors_with_all_three_sources() {
-        let err = resolve_session_name(None, None, None).unwrap_err().to_string();
+        let err = resolve_session_name(None, None, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("--session"), "got: {err}");
         assert!(err.contains("TFMUX_SESSION"), "got: {err}");
         assert!(err.contains(".llm/tfmux-session"), "got: {err}");
@@ -201,7 +204,9 @@ mod tests {
 
     #[test]
     fn session_invalid_name_rejected() {
-        let err = resolve_session_name(Some("a/b"), None, None).unwrap_err().to_string();
+        let err = resolve_session_name(Some("a/b"), None, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("path-safe token"), "got: {err}");
     }
 
@@ -218,7 +223,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".llm")).unwrap();
         fs::write(dir.path().join(".llm/tfmux-session"), "demo\nignored\n").unwrap();
-        assert_eq!(read_session_marker(dir.path()).unwrap(), Some("demo".to_string()));
+        assert_eq!(
+            read_session_marker(dir.path()).unwrap(),
+            Some("demo".to_string())
+        );
     }
 
     #[test]
@@ -306,7 +314,10 @@ mod tests {
         let path = dir.join("targets/agent1.json");
         assert!(path.is_file());
         let raw = fs::read_to_string(&path).unwrap();
-        assert!(raw.ends_with("}\n"), "expected trailing newline, got: {raw:?}");
+        assert!(
+            raw.ends_with("}\n"),
+            "expected trailing newline, got: {raw:?}"
+        );
         let parsed: Target = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed, t);
     }
@@ -320,7 +331,14 @@ mod tests {
 
         let raw = fs::read_to_string(dir.join("targets/agent1.json")).unwrap();
         let order = [
-            "name", "role", "kind", "input", "pane_id", "session", "window", "pane_index",
+            "name",
+            "role",
+            "kind",
+            "input",
+            "pane_id",
+            "session",
+            "window",
+            "pane_index",
             "bound_at",
         ];
         let mut last = 0usize;

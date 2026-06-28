@@ -80,7 +80,10 @@ mod tests {
     #[test]
     fn rejects_path_separators_and_inner_whitespace() {
         for bad in ["a/b", "a\\b", "a b", "a\tb", "a\rb", "a\nb"] {
-            assert!(validate_name(bad).is_err(), "expected {bad:?} to be rejected");
+            assert!(
+                validate_name(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
         }
     }
 

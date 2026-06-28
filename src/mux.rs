@@ -4,7 +4,7 @@
 //! fake through; the `send` feature will grow it with buffer/paste/capture
 //! methods later.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -34,6 +34,19 @@ impl Tmux {
     /// Construct from an explicit binary path (used by tests and `from_env`).
     pub fn new(bin: PathBuf) -> Self {
         Self { bin }
+    }
+
+    /// Resolve the tmux binary from `TFMUX_TMUX_BIN` (else `tmux`) on `PATH`.
+    pub fn from_env() -> Result<Self> {
+        let name = std::env::var("TFMUX_TMUX_BIN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "tmux".to_string());
+        let bin = which::which(&name).map_err(|e| {
+            anyhow!("tmux binary \"{name}\" not found; install tmux or set TFMUX_TMUX_BIN: {e}")
+        })?;
+        Ok(Self::new(bin))
     }
 
     /// Run the tmux binary with `args`, returning stdout on success.
