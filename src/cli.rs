@@ -166,7 +166,10 @@ pub fn deliver_payload(
     }
 
     mux.load_buffer(buffer_name, payload)?;
-    mux.paste_buffer(buffer_name, &target.pane_id)?;
+    if let Err(error) = mux.paste_buffer(buffer_name, &target.pane_id) {
+        let _ = mux.delete_buffer(buffer_name);
+        return Err(error);
+    }
     mux.send_enter(&target.pane_id)?;
     sleep(SEND_SETTLE);
 
@@ -285,6 +288,7 @@ mod tests {
         resolved: Vec<String>,
         loaded: Vec<(String, String)>,
         pasted: Vec<(String, String)>,
+        deleted: Vec<String>,
         enters: Vec<String>,
         captured: Vec<(String, i32)>,
     }
@@ -293,6 +297,7 @@ mod tests {
         calls: Rc<RefCell<DeliveryCalls>>,
         resolves: RefCell<VecDeque<std::result::Result<PaneRef, String>>>,
         captures: RefCell<VecDeque<String>>,
+        paste_error: Option<String>,
     }
 
     impl DeliveryMux {
@@ -301,7 +306,13 @@ mod tests {
                 calls: Rc::new(RefCell::new(DeliveryCalls::default())),
                 resolves: RefCell::new(resolves.into_iter().collect()),
                 captures: RefCell::new(captures.into_iter().map(str::to_string).collect()),
+                paste_error: None,
             }
+        }
+
+        fn with_paste_error(mut self, message: &str) -> Self {
+            self.paste_error = Some(message.to_string());
+            self
         }
     }
 
@@ -328,6 +339,14 @@ mod tests {
                 .borrow_mut()
                 .pasted
                 .push((name.to_string(), pane_id.to_string()));
+            if let Some(message) = &self.paste_error {
+                anyhow::bail!("{message}");
+            }
+            Ok(())
+        }
+
+        fn delete_buffer(&self, name: &str) -> Result<()> {
+            self.calls.borrow_mut().deleted.push(name.to_string());
             Ok(())
         }
 
@@ -516,6 +535,25 @@ mod tests {
     }
 
     #[test]
+    fn send_delivery_deletes_loaded_buffer_when_paste_fails() {
+        let mux =
+            DeliveryMux::new(vec![Ok(pane_ref("%5"))], vec![]).with_paste_error("paste failed");
+        let err = deliver_payload(&mux, &sample_send_target(), "hello", "buf1", &|_| {})
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(err, "paste failed");
+        let calls = mux.calls.borrow();
+        assert_eq!(
+            calls.loaded,
+            vec![("buf1".to_string(), "hello".to_string())]
+        );
+        assert_eq!(calls.deleted, vec!["buf1".to_string()]);
+        assert!(calls.enters.is_empty());
+        assert!(calls.captured.is_empty());
+    }
+
+    #[test]
     fn send_delivery_pasted_content_marker_causes_one_extra_enter() {
         let mux = DeliveryMux::new(
             vec![Ok(pane_ref("%5"))],
@@ -688,7 +726,7 @@ pub fn send(app: &mut App, args: &SendArgs) -> Result<()> {
     let store = Store::new(app.base_dir.clone());
     let session_dir = store
         .find_session_dir(&session_name)?
-        .ok_or_else(no_send_session_selected)?;
+        .ok_or_else(|| missing_send_session(&session_name))?;
     let target = store
         .load_target(&session_dir, &args.name)?
         .ok_or_else(|| {
@@ -734,4 +772,10 @@ fn has_flag_or_env_session(flag: Option<&str>, env: Option<&str>) -> bool {
 
 fn no_send_session_selected() -> anyhow::Error {
     anyhow!("no tfmux session selected; pass --session NAME, set TFMUX_SESSION, or add .llm/tfmux-session")
+}
+
+fn missing_send_session(session_name: &str) -> anyhow::Error {
+    anyhow!(
+        "tfmux session \"{session_name}\" not found; run `tfmux bind <name> ... --session {session_name}` first"
+    )
 }

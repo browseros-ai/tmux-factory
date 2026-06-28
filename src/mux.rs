@@ -1,8 +1,7 @@
-//! tmux interaction: resolving a target to a canonical pane.
+//! tmux interaction: resolving panes and delivering text through buffers.
 //!
-//! Bind only needs `resolve_pane`. The `Mux` trait is the seam tests inject a
-//! fake through; the `send` feature will grow it with buffer/paste/capture
-//! methods later.
+//! The `Mux` trait is the seam tests inject a fake through; the real `Tmux`
+//! backend owns every subprocess call and exact tmux argv shape.
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::Write;
@@ -31,6 +30,9 @@ pub trait Mux {
 
     /// Paste a named tmux buffer into `pane_id`.
     fn paste_buffer(&self, name: &str, pane_id: &str) -> Result<()>;
+
+    /// Delete a named tmux buffer.
+    fn delete_buffer(&self, name: &str) -> Result<()>;
 
     /// Send Enter to `pane_id`.
     fn send_enter(&self, pane_id: &str) -> Result<()>;
@@ -130,6 +132,11 @@ impl Mux for Tmux {
 
     fn paste_buffer(&self, name: &str, pane_id: &str) -> Result<()> {
         self.run(&["paste-buffer", "-d", "-p", "-b", name, "-t", pane_id])?;
+        Ok(())
+    }
+
+    fn delete_buffer(&self, name: &str) -> Result<()> {
+        self.run(&["delete-buffer", "-b", name])?;
         Ok(())
     }
 
@@ -313,6 +320,19 @@ mod tests {
         assert_eq!(output, "captured\n");
         let args = recorded_args(dir.path());
         assert_eq!(args, vec!["capture-pane", "-p", "-t", "%5", "-S", "-80"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_buffer_issues_exact_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_tmux(dir.path(), "");
+        let tmux = Tmux::new(bin);
+
+        tmux.delete_buffer("tfmux-agent1").unwrap();
+
+        let args = recorded_args(dir.path());
+        assert_eq!(args, vec!["delete-buffer", "-b", "tfmux-agent1"]);
     }
 
     // ---- fake-binary helpers ----

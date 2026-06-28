@@ -27,6 +27,7 @@ struct MuxCalls {
     resolved: Vec<String>,
     loaded: Vec<(String, String)>,
     pasted: Vec<(String, String)>,
+    deleted: Vec<String>,
     enters: Vec<String>,
     captured: Vec<(String, i32)>,
 }
@@ -64,6 +65,11 @@ impl Mux for FakeMux {
             .borrow_mut()
             .pasted
             .push((name.to_string(), pane_id.to_string()));
+        Ok(())
+    }
+
+    fn delete_buffer(&self, name: &str) -> anyhow::Result<()> {
+        self.calls.borrow_mut().deleted.push(name.to_string());
         Ok(())
     }
 
@@ -635,7 +641,7 @@ fn send_missing_session_errors_without_creating_state() {
     let err = result.unwrap_err().to_string();
     assert_eq!(
         err,
-        "no tfmux session selected; pass --session NAME, set TFMUX_SESSION, or add .llm/tfmux-session"
+        "tfmux session \"demo\" not found; run `tfmux bind <name> ... --session demo` first"
     );
     assert_eq!(s.built(), 0);
     assert_eq!(s.home_entry_count(), 0);
