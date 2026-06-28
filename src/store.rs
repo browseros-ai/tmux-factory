@@ -85,6 +85,24 @@ impl Store {
             .with_context(|| format!("creating targets dir {}", targets_dir.display()))?;
         write_json_atomic(&targets_dir.join(format!("{}.json", target.name)), target)
     }
+
+    /// Load `<session_dir>/targets/<name>.json`, returning `None` when absent.
+    ///
+    /// # Errors
+    /// Returns an error when `name` is invalid, the target file cannot be read,
+    /// or the JSON cannot be decoded as a `Target`.
+    pub fn load_target(&self, session_dir: &Path, name: &str) -> Result<Option<Target>> {
+        validate_name(name)?;
+        let path = session_dir.join("targets").join(format!("{name}.json"));
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(anyhow!("reading {}: {}", path.display(), e)),
+        };
+        let target = serde_json::from_str(&raw)
+            .with_context(|| format!("decoding target {}", path.display()))?;
+        Ok(Some(target))
+    }
 }
 
 /// Resolve the session name from the precedence chain
@@ -350,5 +368,29 @@ mod tests {
             assert!(pos >= last, "key {key} out of declared order");
             last = pos;
         }
+    }
+
+    // ---- load_target ----
+
+    #[test]
+    fn load_target_reads_bound_target_json() {
+        let base = tempfile::tempdir().unwrap();
+        let store = Store::new(base.path().to_path_buf());
+        let dir = store.create_session("demo", fixed_now()).unwrap();
+        let target = sample_target();
+        store.save_target(&dir, &target).unwrap();
+
+        let loaded = store.load_target(&dir, "agent1").unwrap();
+        assert_eq!(loaded, Some(target));
+    }
+
+    #[test]
+    fn load_target_missing_is_none() {
+        let base = tempfile::tempdir().unwrap();
+        let store = Store::new(base.path().to_path_buf());
+        let dir = store.create_session("demo", fixed_now()).unwrap();
+
+        assert_eq!(store.load_target(&dir, "agent1").unwrap(), None);
+        assert!(!base.path().join("current").exists());
     }
 }

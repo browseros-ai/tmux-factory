@@ -1,5 +1,6 @@
-use std::io;
+use std::io::{self, Read};
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
 use clap::Parser;
@@ -23,6 +24,19 @@ fn main() -> ExitCode {
     let env_fn = |k: &str| std::env::var(k).ok();
     let now_fn = || Utc::now();
     let new_mux = || -> anyhow::Result<Box<dyn Mux>> { Ok(Box::new(Tmux::from_env()?)) };
+    let read_stdin = || -> anyhow::Result<String> {
+        let mut buf = String::new();
+        io::stdin().read_to_string(&mut buf)?;
+        Ok(buf)
+    };
+    let new_buffer_name = || -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        format!("tfmux-send-{nanos}")
+    };
+    let sleep = |duration| std::thread::sleep(duration);
     let mut out = io::stdout();
 
     let mut app = App {
@@ -31,6 +45,9 @@ fn main() -> ExitCode {
         cwd,
         now: &now_fn,
         new_mux: &new_mux,
+        read_stdin: &read_stdin,
+        new_buffer_name: &new_buffer_name,
+        sleep: &sleep,
         out: &mut out,
     };
 

@@ -1,12 +1,12 @@
-//! tmux interaction: resolving a target to a canonical pane.
+//! tmux interaction: resolving panes and delivering text through buffers.
 //!
-//! Bind only needs `resolve_pane`. The `Mux` trait is the seam tests inject a
-//! fake through; the `send` feature will grow it with buffer/paste/capture
-//! methods later.
+//! The `Mux` trait is the seam tests inject a fake through; the real `Tmux`
+//! backend owns every subprocess call and exact tmux argv shape.
 
 use anyhow::{anyhow, bail, Context, Result};
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Canonical pane information resolved from a tmux target.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +24,21 @@ pub struct PaneRef {
 pub trait Mux {
     /// Resolve a tmux target string to canonical pane information.
     fn resolve_pane(&self, target: &str) -> Result<PaneRef>;
+
+    /// Load `text` into a named tmux buffer.
+    fn load_buffer(&self, name: &str, text: &str) -> Result<()>;
+
+    /// Paste a named tmux buffer into `pane_id`.
+    fn paste_buffer(&self, name: &str, pane_id: &str) -> Result<()>;
+
+    /// Delete a named tmux buffer.
+    fn delete_buffer(&self, name: &str) -> Result<()>;
+
+    /// Send Enter to `pane_id`.
+    fn send_enter(&self, pane_id: &str) -> Result<()>;
+
+    /// Capture text from `pane_id`, optionally including scrollback lines.
+    fn capture_pane(&self, pane_id: &str, scrollback: i32) -> Result<String>;
 }
 
 /// Real tmux backend that shells out to the `tmux` binary.
@@ -53,10 +68,33 @@ impl Tmux {
     /// Run the tmux binary with `args`, returning stdout on success.
     /// On failure the error carries the trimmed combined stdout+stderr.
     fn run(&self, args: &[&str]) -> Result<String> {
-        let output = Command::new(&self.bin)
+        self.run_with_stdin(args, None)
+    }
+
+    /// Run the tmux binary with optional stdin, returning stdout on success.
+    fn run_with_stdin(&self, args: &[&str], stdin: Option<&str>) -> Result<String> {
+        let mut child = Command::new(&self.bin)
             .args(args)
-            .output()
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .with_context(|| format!("running {}", self.bin.display()))?;
+        if let Some(input) = stdin {
+            let mut pipe = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow!("opening stdin for {}", self.bin.display()))?;
+            pipe.write_all(input.as_bytes())
+                .with_context(|| format!("writing stdin for {}", self.bin.display()))?;
+        }
+        let output = child
+            .wait_with_output()
+            .with_context(|| format!("waiting for {}", self.bin.display()))?;
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
         }
@@ -85,6 +123,35 @@ impl Mux for Tmux {
             "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}",
         ])?;
         parse_pane_ref(target, &out)
+    }
+
+    fn load_buffer(&self, name: &str, text: &str) -> Result<()> {
+        self.run_with_stdin(&["load-buffer", "-b", name, "-"], Some(text))?;
+        Ok(())
+    }
+
+    fn paste_buffer(&self, name: &str, pane_id: &str) -> Result<()> {
+        self.run(&["paste-buffer", "-d", "-p", "-b", name, "-t", pane_id])?;
+        Ok(())
+    }
+
+    fn delete_buffer(&self, name: &str) -> Result<()> {
+        self.run(&["delete-buffer", "-b", name])?;
+        Ok(())
+    }
+
+    fn send_enter(&self, pane_id: &str) -> Result<()> {
+        self.run(&["send-keys", "-t", pane_id, "Enter"])?;
+        Ok(())
+    }
+
+    fn capture_pane(&self, pane_id: &str, scrollback: i32) -> Result<String> {
+        if scrollback > 0 {
+            let scrollback = format!("-{scrollback}");
+            self.run(&["capture-pane", "-p", "-t", pane_id, "-S", &scrollback])
+        } else {
+            self.run(&["capture-pane", "-p", "-t", pane_id])
+        }
     }
 }
 
@@ -197,6 +264,77 @@ mod tests {
         assert!(err.contains("tmux target is required"), "got: {err}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn load_buffer_issues_exact_argv_and_writes_payload_to_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_tmux(dir.path(), "");
+        let tmux = Tmux::new(bin);
+
+        tmux.load_buffer("tfmux-agent1", "hello\nworld").unwrap();
+
+        let args = recorded_args(dir.path());
+        assert_eq!(args, vec!["load-buffer", "-b", "tfmux-agent1", "-"]);
+        let stdin = fs::read_to_string(dir.path().join("stdin.txt")).unwrap();
+        assert_eq!(stdin, "hello\nworld");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paste_buffer_issues_exact_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_tmux(dir.path(), "");
+        let tmux = Tmux::new(bin);
+
+        tmux.paste_buffer("tfmux-agent1", "%5").unwrap();
+
+        let args = recorded_args(dir.path());
+        assert_eq!(
+            args,
+            vec!["paste-buffer", "-d", "-p", "-b", "tfmux-agent1", "-t", "%5",]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn send_enter_issues_exact_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_tmux(dir.path(), "");
+        let tmux = Tmux::new(bin);
+
+        tmux.send_enter("%5").unwrap();
+
+        let args = recorded_args(dir.path());
+        assert_eq!(args, vec!["send-keys", "-t", "%5", "Enter"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_pane_issues_exact_argv_and_returns_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_tmux(dir.path(), "captured\n");
+        let tmux = Tmux::new(bin);
+
+        let output = tmux.capture_pane("%5", 80).unwrap();
+
+        assert_eq!(output, "captured\n");
+        let args = recorded_args(dir.path());
+        assert_eq!(args, vec!["capture-pane", "-p", "-t", "%5", "-S", "-80"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_buffer_issues_exact_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_tmux(dir.path(), "");
+        let tmux = Tmux::new(bin);
+
+        tmux.delete_buffer("tfmux-agent1").unwrap();
+
+        let args = recorded_args(dir.path());
+        assert_eq!(args, vec!["delete-buffer", "-b", "tfmux-agent1"]);
+    }
+
     // ---- fake-binary helpers ----
 
     #[cfg(unix)]
@@ -212,6 +350,26 @@ mod tests {
     fn write_failing_tmux(dir: &Path, stderr: &str) -> PathBuf {
         let script = format!("#!/bin/sh\necho {stderr:?} >&2\nexit 1\n");
         write_script(dir.join("faketmux-fail"), &script)
+    }
+
+    #[cfg(unix)]
+    fn write_recording_tmux(dir: &Path, response: &str) -> PathBuf {
+        let argv = dir.join("argv.txt");
+        let stdin = dir.join("stdin.txt");
+        let resp = dir.join("response.txt");
+        fs::write(&resp, response).unwrap();
+        let script =
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {argv:?}\ncat > {stdin:?}\ncat {resp:?}\n");
+        write_script(dir.join("faketmux-record"), &script)
+    }
+
+    #[cfg(unix)]
+    fn recorded_args(dir: &Path) -> Vec<String> {
+        fs::read_to_string(dir.join("argv.txt"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     #[cfg(unix)]

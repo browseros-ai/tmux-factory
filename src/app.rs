@@ -7,6 +7,7 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::mux::Mux;
 
@@ -23,6 +24,12 @@ pub struct App<'a> {
     /// Lazily-built tmux backend (constructed only when a command needs it, so
     /// pure-validation failure paths never shell out to tmux).
     pub new_mux: &'a dyn Fn() -> Result<Box<dyn Mux>>,
+    /// Read all text from stdin when a command explicitly asks for `-`.
+    pub read_stdin: &'a dyn Fn() -> Result<String>,
+    /// Generate a tmux buffer name for one send attempt.
+    pub new_buffer_name: &'a dyn Fn() -> String,
+    /// Sleep after submitting text so tmux/TUI capture can settle.
+    pub sleep: &'a dyn Fn(Duration),
     /// Success output sink.
     pub out: &'a mut dyn Write,
 }
