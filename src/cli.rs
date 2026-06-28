@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use serde::Serialize;
 use std::fs;
 use std::time::Duration;
 
@@ -18,7 +19,7 @@ const SEND_CAPTURE_SCROLLBACK: i32 = 80;
 #[command(
     name = "tfmux",
     version,
-    about = "Drive a tmux agent fleet: bind named panes."
+    about = "Drive a tmux agent fleet."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -32,6 +33,8 @@ pub enum Command {
     Bind(BindArgs),
     /// Send text to a bound tmux pane.
     Send(SendArgs),
+    /// Remove a bound target from a session.
+    Unbind(UnbindArgs),
 }
 
 /// Arguments for `tfmux bind`.
@@ -76,6 +79,26 @@ pub struct SendArgs {
     /// Override session selection.
     #[arg(long, value_name = "NAME")]
     pub session: Option<String>,
+}
+
+/// Arguments for `tfmux unbind`.
+#[derive(Args)]
+pub struct UnbindArgs {
+    /// Target name (a single path-safe token).
+    pub name: String,
+    /// Override session selection.
+    #[arg(long, value_name = "NAME")]
+    pub session: Option<String>,
+    /// Print a stable JSON summary instead of the text summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Serialize)]
+struct UnbindOutput<'a> {
+    session: &'a str,
+    name: &'a str,
+    removed: bool,
 }
 
 /// Resolve and read the payload for `tfmux send`.
@@ -462,7 +485,7 @@ mod tests {
 
         match cli.command {
             Command::Send(args) => assert_eq!(args.file.as_deref(), Some("")),
-            Command::Bind(_) => panic!("expected send command"),
+            Command::Bind(_) | Command::Unbind(_) => panic!("expected send command"),
         }
     }
 
@@ -746,6 +769,51 @@ pub fn send(app: &mut App, args: &SendArgs) -> Result<()> {
         "sent {} bytes to \"{}\" ({})",
         sent.bytes, target.name, sent.pane_id
     )?;
+    Ok(())
+}
+
+/// Handle `tfmux unbind`: remove one target file from an existing session.
+///
+/// # Errors
+/// Returns an error on invalid names, missing session selection, missing
+/// sessions, missing targets, or filesystem deletion failures.
+pub fn unbind(app: &mut App, args: &UnbindArgs) -> Result<()> {
+    validate_name(&args.name)?;
+
+    let env_session = (app.env)("TFMUX_SESSION");
+    let marker = if has_flag_or_env_session(args.session.as_deref(), env_session.as_deref()) {
+        None
+    } else {
+        store::read_session_marker(&app.cwd)?
+    };
+    let session_name = resolve_send_session_name(
+        args.session.as_deref(),
+        env_session.as_deref(),
+        marker.as_deref(),
+    )?;
+
+    let store = Store::new(app.base_dir.clone());
+    let session_dir = store
+        .find_session_dir(&session_name)?
+        .ok_or_else(|| anyhow!("no tfmux session \"{session_name}\""))?;
+    if !store.delete_target(&session_dir, &args.name)? {
+        bail!("no target \"{}\" in session {}", args.name, session_name);
+    }
+
+    if args.json {
+        let output = UnbindOutput {
+            session: &session_name,
+            name: &args.name,
+            removed: true,
+        };
+        writeln!(app.out, "{}", serde_json::to_string_pretty(&output)?)?;
+    } else {
+        writeln!(
+            app.out,
+            "unbound \"{}\" from session {}",
+            args.name, session_name
+        )?;
+    }
     Ok(())
 }
 
