@@ -1031,6 +1031,21 @@ fn targets_resolves_session_from_local_marker() {
 }
 
 #[test]
+fn targets_without_any_session_selection_errors_without_creating_state() {
+    let s = Scenario::new();
+
+    let (result, _) = s.run(&["tfmux", "targets"]);
+
+    let err = result.unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "no tfmux session selected; pass --session NAME, set TFMUX_SESSION, or add .llm/tfmux-session"
+    );
+    assert_eq!(s.built(), 0);
+    assert_eq!(s.home_entry_count(), 0);
+}
+
+#[test]
 fn targets_missing_session_errors_without_creating_state() {
     let s = Scenario::new();
 
