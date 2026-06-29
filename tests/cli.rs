@@ -1004,6 +1004,37 @@ fn detach_rejects_repo_not_on_main_before_pr_or_cleanup() {
 }
 
 #[test]
+fn detach_rejects_repo_and_worktree_resolving_to_same_checkout() {
+    let s = Scenario::new();
+    let worktree = s.worktree_arg();
+
+    let (result, _) = s.run(&[
+        "tfmux",
+        "detach",
+        "worker",
+        "--worktree",
+        &worktree,
+        "--repo",
+        &worktree,
+        "--pr",
+        "12",
+    ]);
+
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("--repo and --worktree both resolve to"),
+        "got: {err}"
+    );
+    assert!(
+        err.contains("run from the main checkout or pass --repo PATH"),
+        "got: {err}"
+    );
+    assert!(s.github_calls().prs.is_empty());
+    assert!(s.git_calls().removed_worktrees.is_empty());
+    assert!(s.killed_sessions().is_empty());
+}
+
+#[test]
 fn detach_rejects_dirty_main_checkout_before_pr_or_cleanup() {
     let s = Scenario::new().repo_status(" M README.md\n");
     let worktree = s.worktree_arg();

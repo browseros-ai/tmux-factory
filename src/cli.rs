@@ -630,7 +630,7 @@ pub fn detach(app: &mut App, args: &DetachArgs) -> Result<()> {
     }
     if worktree_root == repo_root {
         bail!(
-            "--worktree points at the main checkout {}; pass the agent worktree path",
+            "--repo and --worktree both resolve to {}; run from the main checkout or pass --repo PATH to it",
             worktree_root.display()
         );
     }
