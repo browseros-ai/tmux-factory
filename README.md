@@ -1,171 +1,234 @@
 # tfmux
 
-A small, synchronous Rust CLI for driving a fleet of agents that each live in
-their own tmux pane: bind panes to names, send prompts into them, and let agents
-report back.
+`tfmux` is a small synchronous Rust CLI for coordinating named tmux panes. Bind
+panes to stable names, send work into them, and let agents report back by
+sending text to the mediator pane.
 
-*Inspired by `riff3`; shares no state, paths, or commands with it.*
+Inspired by `riff3`; it shares no state, paths, or commands with it.
 
-## What it does
+## What tfmux Does
 
-- **Names tmux panes as targets** — `mediator`, `agent1`, `agent2`, ….
-- **Sends prompts/text into those panes** via a tmux buffer + bracketed paste +
-  Enter, then verifies the paste actually landed.
-- **Lets agents report back** by sending to the `mediator` target — the "I'm
-  done" callback is just `tfmux send mediator --text "done"`, no special command.
-- **Attaches detached tmux sessions** in a new window of the current tmux client
-  for operator convenience.
-- **Keeps state under `~/.tfmux`** — one `session.json` per session, one JSON
-  file per bound target. `attach` does not read or write this state.
-- **No transcript, inbox, or dashboard.** It is a transport, nothing more.
+- Names tmux panes as targets such as `mediator`, `agent1`, or `agent2`.
+- Sends text, files, or stdin through a tmux buffer, pastes it, presses Enter,
+  and verifies the payload was submitted.
+- Lets any pane report back with ordinary sends, for example
+  `tfmux send mediator --text "done"`.
+- Lists bound targets and marks each pane `live`, `stale`, or `dead`.
+- Opens detached tmux sessions in a new window of the current tmux client.
+- Stores only lightweight session and target JSON under `~/.tfmux` or
+  `$TFMUX_HOME`.
 
-## Install / build
+No transcript, inbox, dashboard, or background service is included.
+
+## Install
 
 ```bash
-cargo build                 # debug binary at target/debug/tfmux
-cargo install --path .      # optional: install tfmux into ~/.cargo/bin
+cargo build
+cargo install --path .
 ```
 
-Requires a `tmux` binary on `PATH` (override with `TFMUX_TMUX_BIN`).
+`cargo build` writes the debug binary to `target/debug/tfmux`. `cargo install
+--path .` installs `tfmux` into `~/.cargo/bin`.
 
-## Session model
-
-A session groups the targets of one factory. There is no global "current
-session" — session identity travels with the pane, so many factories can run at
-once.
-
-- **State root:** `$TFMUX_HOME` if set, otherwise `~/.tfmux`.
-- **Session selection precedence** (used by stateful target commands):
-  1. `--session NAME` flag
-  2. `TFMUX_SESSION` environment variable
-  3. `.llm/tfmux-session` marker (first line) in the current directory
-- `bind` **creates** the session on first use; `send`, `targets`, and `unbind`
-  require it to already exist.
-- There is deliberately **no** `~/.tfmux/current` file.
-
-## Commands
-
-Tfmux target names and tfmux state session names must be single path-safe tokens.
-On error, tfmux prints `error: <msg>` to stderr and exits 1.
-
-### `tfmux bind <NAME>`
-
-Register a tmux pane under `NAME` in the current session.
+`tfmux` requires `tmux` on `PATH`. To use a different binary, set:
 
 ```bash
-# Bind the mediator to the current pane (run from inside tmux).
-tfmux bind mediator --here --role mediator
-# -> bound mediator -> %3 (demo:0.0)
-
-# Bind an agent pane by tmux target.
-tfmux bind agent1 --tmux %5 --role agent --kind claude
-# -> bound agent1 -> %5 (demo:1.0)
+export TFMUX_TMUX_BIN=/path/to/tmux
 ```
 
-Pick exactly one pane source: `--here` (binds the current pane via `TMUX_PANE`)
-or `--tmux <TARGET>` (any tmux target string, e.g. `%5` or `sess:1.0`).
-`--role` is `mediator` or `agent` (default `agent`); `--kind` is `claude`,
-`codex`, or `generic` (default `generic`) — both are light metadata. Add
-`--json` to print the stored target instead of the text summary.
+## Quick Start
 
-### `tfmux send <NAME>`
-
-Deliver a payload to a bound target's pane and verify it was submitted.
+Run the binding commands from inside tmux.
 
 ```bash
-tfmux send agent1 --text "Investigate the flaky test in store.rs"
-# -> sent 38 bytes to "agent1" (%5)
-
-tfmux send agent1 --file plan.md      # send a file's contents
-echo "build and report back" | tfmux send agent1 -   # read payload from stdin
-```
-
-Pass exactly one input source: `--text`, `--file`, or `-` (stdin). If the pane
-is gone or no longer resolves to the same id, `send` fails and tells you to
-rebind.
-
-### `tfmux attach <TMUX_SESSION>`
-
-Attach a detached tmux session inside a new window of the current tmux client.
-This is independent of tfmux factory state: it does not read `TFMUX_SESSION`,
-`.llm/tfmux-session`, or `~/.tfmux`.
-
-```bash
-tfmux attach worker
-# -> attached "worker" in new window "worker"
-
-tfmux attach worker --window-name agent-worker
-# -> attached "worker" in new window "agent-worker"
-```
-
-Run it from inside tmux. `attach` first checks `tmux has-session -t
-<TMUX_SESSION>`, then opens a new window that runs `env -u TMUX tmux
-attach-session -t <TMUX_SESSION>`.
-
-### `tfmux targets`
-
-List bound targets in the session and re-check each pane's live/stale/dead
-status.
-
-```bash
-tfmux targets
-# NAME       ROLE     KIND     PANE   LOCATION       STATUS
-# agent1     agent    claude   %5     demo:1.0       live
-# mediator   mediator generic  %3     demo:0.0       live
-
-tfmux targets --json    # machine-readable rows for the mediator
-```
-
-### `tfmux unbind <NAME>`
-
-Remove one target from the session.
-
-```bash
-tfmux unbind agent1
-# -> unbound "agent1" from session demo
-```
-
-Add `--json` for a stable summary.
-
-Stateful target commands accept `--session NAME` to override session selection.
-`attach` takes a raw tmux session name instead.
-
-## Minimal workflow
-
-```bash
-# 1. In the mediator pane (inside tmux), name the session and bind yourself.
+# 1. Pick the tfmux session for this factory.
 export TFMUX_SESSION=demo
+
+# 2. Bind the mediator to the current pane.
 tfmux bind mediator --here --role mediator
 
-# 2. Bind an agent pane you spawned (split/new-window) by its tmux pane id.
+# 3. Bind an agent pane by tmux target or pane id.
 tfmux bind agent1 --tmux %7 --role agent --kind claude
 
-# 3. Send work to the agent.
+# 4. Send work to the agent.
 tfmux send agent1 --text "Investigate the flaky test in store.rs and report back"
 
-# 4. From the agent pane (sharing the session via TFMUX_SESSION=demo or a
-#    .llm/tfmux-session marker), report completion back to the mediator.
+# 5. From the agent pane, send completion back to the mediator.
 tfmux send mediator --text "agent1 done"
 ```
 
-## Storage layout
+Agents need the same tfmux session context as the mediator. Share it with
+`TFMUX_SESSION=demo`, pass `--session demo`, or add a `.llm/tfmux-session`
+marker in the working directory.
 
+## Session Model
+
+A tfmux session groups the targets for one factory. There is no global current
+session file; session identity comes from the command context.
+
+Stateful commands resolve the session in this order:
+
+1. `--session NAME`
+2. `TFMUX_SESSION`
+3. First line of `.llm/tfmux-session` in the current directory
+
+`bind` creates the session the first time it is used. `send`, `targets`, and
+`unbind` require an existing session.
+
+Target names and tfmux session names must be single path-safe tokens: no spaces,
+slashes, backslashes, tabs, or newlines.
+
+## Commands
+
+On failure, `tfmux` prints `error: <message>` to stderr and exits with status 1.
+
+### Bind a Pane
+
+```bash
+tfmux bind <NAME> (--here | --tmux <TARGET>) [--role mediator|agent] [--kind claude|codex|generic]
 ```
-~/.tfmux/                       # or $TFMUX_HOME
-  2026-06-28/                   # session creation date (local calendar date)
-    demo/                       # session name
-      session.json              # { name, created_at }
+
+Examples:
+
+```bash
+tfmux bind mediator --here --role mediator
+tfmux bind agent1 --tmux %5 --role agent --kind claude
+tfmux bind agent2 --tmux demo:1.0 --session demo --json
+```
+
+Use exactly one pane source:
+
+- `--here` reads `TMUX_PANE` and binds the current pane.
+- `--tmux <TARGET>` resolves any tmux target string, such as `%5` or
+  `demo:1.0`.
+
+`--role` defaults to `agent`; `--kind` defaults to `generic`. Both are stored as
+metadata. `--json` prints the stored target record instead of the text summary.
+
+### Send to a Target
+
+```bash
+tfmux send <NAME> (--text <TEXT> | --file <FILE> | -) [--session NAME]
+```
+
+Examples:
+
+```bash
+tfmux send agent1 --text "Investigate the flaky test in store.rs"
+tfmux send agent1 --file plan.md
+echo "build and report back" | tfmux send agent1 -
+```
+
+Use exactly one input source. Empty payloads fail.
+
+Before sending, tfmux re-resolves the stored pane id and checks that the pane
+metadata still matches the binding. If the pane is gone or changed, `send`
+fails and asks you to rebind.
+
+Delivery uses a named tmux buffer, paste, Enter, and a short scrollback check.
+If a Claude/Codex pasted-content marker is still visible, tfmux sends one more
+Enter and checks again.
+
+### List Targets
+
+```bash
+tfmux targets [--session NAME] [--json]
+```
+
+Text output:
+
+```text
+NAME       ROLE     KIND     PANE   LOCATION       STATUS
+agent1     agent    claude   %5     demo:1.0       live
+mediator   mediator generic  %3     demo:0.0       live
+```
+
+`targets` reloads all bound targets for the session and checks each pane:
+
+- `live` means the pane id and stored tmux metadata still match.
+- `stale` means the pane id resolves, but its session/window/pane metadata
+  changed.
+- `dead` means the pane no longer resolves.
+
+Use `--json` for machine-readable rows.
+
+### Attach a Tmux Session
+
+```bash
+tfmux attach <TMUX_SESSION> [--window-name NAME]
+```
+
+Examples:
+
+```bash
+tfmux attach worker
+tfmux attach worker --window-name agent-worker
+```
+
+Run `attach` from inside tmux. It checks `tmux has-session -t <TMUX_SESSION>`,
+then opens a new window that runs:
+
+```bash
+env -u TMUX tmux attach-session -t <TMUX_SESSION>
+```
+
+`attach` is independent of tfmux factory state. It does not read
+`TFMUX_SESSION`, `.llm/tfmux-session`, or `~/.tfmux`.
+
+### Unbind a Target
+
+```bash
+tfmux unbind <NAME> [--session NAME] [--json]
+```
+
+Example:
+
+```bash
+tfmux unbind agent1
+```
+
+`unbind` removes the target JSON file from the selected session. With `--json`,
+it prints a stable summary containing the session, target name, and whether a
+file was removed.
+
+## Storage
+
+Default state root:
+
+```text
+~/.tfmux
+```
+
+Override it with:
+
+```bash
+export TFMUX_HOME=/path/to/state
+```
+
+Layout:
+
+```text
+~/.tfmux/
+  2026-06-28/
+    demo/
+      session.json
       targets/
-        mediator.json           # one file per bound target
+        mediator.json
         agent1.json
 ```
+
+The date directory is the local calendar date when the session is created.
+`session.json` stores the session name and creation timestamp. Each target JSON
+stores the bound name, role, kind, original tmux target input, canonical pane id,
+tmux location, and bind timestamp.
 
 ## Development
 
 ```bash
-cargo fmt --check                           # formatting is the source of truth
-cargo test                                  # unit tests + tests/cli.rs
-cargo clippy --all-targets -- -D warnings   # must pass clean
+cargo fmt --check
+cargo test
+cargo clippy --all-targets -- -D warnings
 ```
 
-See `CLAUDE.md` for the full contributor and architecture guidelines.
+Use `cargo fmt` before committing. See `CLAUDE.md` for contributor rules and
+module ownership.
