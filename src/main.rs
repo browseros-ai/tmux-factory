@@ -8,12 +8,13 @@ use clap::Parser;
 
 use tfmux::app::{base_dir_from_env, App};
 use tfmux::cli::{Cli, Command};
+use tfmux::git::{CliGit, CliGitHub, Git, GitHub};
 use tfmux::mux::{Mux, Tmux};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if matches!(&cli.command, Command::Attach(_)) {
-        return run_attach(cli);
+    if matches!(&cli.command, Command::Attach(_) | Command::Detach(_)) {
+        return run_without_store(cli);
     }
 
     let base_dir = match base_dir_from_env() {
@@ -28,6 +29,8 @@ fn main() -> ExitCode {
     let env_fn = |k: &str| std::env::var(k).ok();
     let now_fn = || Utc::now();
     let new_mux = || -> anyhow::Result<Box<dyn Mux>> { Ok(Box::new(Tmux::from_env()?)) };
+    let new_git = || -> anyhow::Result<Box<dyn Git>> { Ok(Box::new(CliGit::from_env()?)) };
+    let new_github = || -> anyhow::Result<Box<dyn GitHub>> { Ok(Box::new(CliGitHub::from_env()?)) };
     let read_stdin = || -> anyhow::Result<String> {
         let mut buf = String::new();
         io::stdin().read_to_string(&mut buf)?;
@@ -49,6 +52,8 @@ fn main() -> ExitCode {
         cwd,
         now: &now_fn,
         new_mux: &new_mux,
+        new_git: &new_git,
+        new_github: &new_github,
         read_stdin: &read_stdin,
         new_buffer_name: &new_buffer_name,
         sleep: &sleep,
@@ -61,10 +66,16 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_attach(cli: Cli) -> ExitCode {
+fn run_without_store(cli: Cli) -> ExitCode {
+    let cwd = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => return fail(e.into()),
+    };
     let env_fn = |k: &str| std::env::var(k).ok();
     let now_fn = || Utc::now();
     let new_mux = || -> anyhow::Result<Box<dyn Mux>> { Ok(Box::new(Tmux::from_env()?)) };
+    let new_git = || -> anyhow::Result<Box<dyn Git>> { Ok(Box::new(CliGit::from_env()?)) };
+    let new_github = || -> anyhow::Result<Box<dyn GitHub>> { Ok(Box::new(CliGitHub::from_env()?)) };
     let read_stdin = || -> anyhow::Result<String> { Ok(String::new()) };
     let new_buffer_name = || -> String { String::new() };
     let sleep = |_duration| {};
@@ -73,9 +84,11 @@ fn run_attach(cli: Cli) -> ExitCode {
     let mut app = App {
         base_dir: PathBuf::new(),
         env: &env_fn,
-        cwd: PathBuf::new(),
+        cwd,
         now: &now_fn,
         new_mux: &new_mux,
+        new_git: &new_git,
+        new_github: &new_github,
         read_stdin: &read_stdin,
         new_buffer_name: &new_buffer_name,
         sleep: &sleep,

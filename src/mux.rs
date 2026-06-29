@@ -45,6 +45,9 @@ pub trait Mux {
 
     /// Open a new tmux window that attaches to `session` with `TMUX` unset.
     fn attach_session_in_new_window(&self, session: &str, window_name: &str) -> Result<()>;
+
+    /// Kill a tmux session.
+    fn kill_session(&self, session: &str) -> Result<()>;
 }
 
 /// Real tmux backend that shells out to the `tmux` binary.
@@ -171,6 +174,11 @@ impl Mux for Tmux {
             shell_quote(session)
         );
         self.run(&["new-window", "-n", window_name, &command])?;
+        Ok(())
+    }
+
+    fn kill_session(&self, session: &str) -> Result<()> {
+        self.run(&["kill-session", "-t", session])?;
         Ok(())
     }
 }
@@ -425,6 +433,19 @@ mod tests {
                 "env -u TMUX tmux attach-session -t 'work session'\\''s $main'",
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_session_issues_exact_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_tmux(dir.path(), "");
+        let tmux = Tmux::new(bin);
+
+        tmux.kill_session("worker").unwrap();
+
+        let args = recorded_args(dir.path());
+        assert_eq!(args, vec!["kill-session", "-t", "worker"]);
     }
 
     #[cfg(unix)]
