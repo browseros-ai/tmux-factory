@@ -247,3 +247,263 @@ fn command_detail(stdout: &[u8], stderr: &[u8]) -> String {
     detail.push_str(&String::from_utf8_lossy(stderr));
     detail.trim().to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_git_root_issues_exact_argv_and_trims_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_bin(dir.path(), "/tmp/repo\n");
+        let git = CliGit { bin };
+
+        let root = git.root(dir.path()).unwrap();
+
+        assert_eq!(root, PathBuf::from("/tmp/repo"));
+        assert_eq!(
+            recorded_args(dir.path()),
+            vec!["rev-parse", "--show-toplevel"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_git_status_issues_exact_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_bin(dir.path(), " M README.md\n");
+        let git = CliGit { bin };
+
+        let status = git.status_porcelain(dir.path()).unwrap();
+
+        assert_eq!(status, " M README.md\n");
+        assert_eq!(
+            recorded_args(dir.path()),
+            vec!["status", "--porcelain", "--untracked-files=all"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_git_current_branch_issues_exact_argv_and_trims_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_bin(dir.path(), "feature/demo\n");
+        let git = CliGit { bin };
+
+        let branch = git.current_branch(dir.path()).unwrap();
+
+        assert_eq!(branch, "feature/demo");
+        assert_eq!(recorded_args(dir.path()), vec!["branch", "--show-current"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_git_current_branch_rejects_detached_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_bin(dir.path(), "\n");
+        let git = CliGit { bin };
+
+        let err = git.current_branch(dir.path()).unwrap_err().to_string();
+
+        assert!(err.contains("git checkout is detached"), "got: {err}");
+        assert_eq!(recorded_args(dir.path()), vec!["branch", "--show-current"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_git_fetch_issues_exact_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_bin(dir.path(), "");
+        let git = CliGit { bin };
+
+        git.fetch(dir.path(), "origin", "main").unwrap();
+
+        assert_eq!(recorded_args(dir.path()), vec!["fetch", "origin", "main"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_git_pull_ff_only_issues_exact_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_bin(dir.path(), "");
+        let git = CliGit { bin };
+
+        git.pull_ff_only(dir.path(), "upstream", "trunk").unwrap();
+
+        assert_eq!(
+            recorded_args(dir.path()),
+            vec!["pull", "--ff-only", "upstream", "trunk"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_git_merge_base_is_ancestor_issues_exact_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_bin(dir.path(), "");
+        let git = CliGit { bin };
+
+        git.merge_base_is_ancestor(dir.path(), "abc123", "main")
+            .unwrap();
+
+        assert_eq!(
+            recorded_args(dir.path()),
+            vec!["merge-base", "--is-ancestor", "abc123", "main"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_git_remove_worktree_issues_exact_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_bin(dir.path(), "");
+        let git = CliGit { bin };
+        let worktree = dir.path().join("worker");
+
+        git.remove_worktree(dir.path(), &worktree).unwrap();
+
+        assert_eq!(
+            recorded_args(dir.path()),
+            vec![
+                "worktree".to_string(),
+                "remove".to_string(),
+                worktree.display().to_string(),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_github_pull_request_issues_exact_argv_and_parses_merged_pr() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{
+            "state": "MERGED",
+            "mergedAt": "2026-06-28T12:00:00Z",
+            "mergeCommit": { "oid": "abc123" },
+            "headRefName": "feat/demo",
+            "baseRefName": "main",
+            "url": "https://github.com/example/repo/pull/12"
+        }"#;
+        let bin = write_recording_bin(dir.path(), json);
+        let github = CliGitHub { bin };
+
+        let pr = github.pull_request(dir.path(), "12").unwrap();
+
+        assert_eq!(
+            recorded_args(dir.path()),
+            vec![
+                "pr",
+                "view",
+                "12",
+                "--json",
+                "state,mergedAt,mergeCommit,headRefName,baseRefName,url"
+            ]
+        );
+        assert_eq!(pr.state, "MERGED");
+        assert_eq!(pr.merged_at.as_deref(), Some("2026-06-28T12:00:00Z"));
+        assert_eq!(pr.merge_commit.as_deref(), Some("abc123"));
+        assert_eq!(pr.head_ref_name, "feat/demo");
+        assert_eq!(pr.base_ref_name, "main");
+        assert_eq!(pr.url, "https://github.com/example/repo/pull/12");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_github_pull_request_parses_null_merge_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{
+            "state": "CLOSED",
+            "mergedAt": null,
+            "mergeCommit": null,
+            "headRefName": "feat/demo",
+            "baseRefName": "main",
+            "url": "https://github.com/example/repo/pull/12"
+        }"#;
+        let bin = write_recording_bin(dir.path(), json);
+        let github = CliGitHub { bin };
+
+        let pr = github
+            .pull_request(dir.path(), "https://github.com/example/repo/pull/12")
+            .unwrap();
+
+        assert_eq!(
+            recorded_args(dir.path()),
+            vec![
+                "pr",
+                "view",
+                "https://github.com/example/repo/pull/12",
+                "--json",
+                "state,mergedAt,mergeCommit,headRefName,baseRefName,url"
+            ]
+        );
+        assert_eq!(pr.state, "CLOSED");
+        assert_eq!(pr.merged_at, None);
+        assert_eq!(pr.merge_commit, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_github_pull_request_surfaces_json_decode_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_bin(dir.path(), "not json");
+        let github = CliGitHub { bin };
+
+        let err = github
+            .pull_request(dir.path(), "12")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("decoding gh PR JSON"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_git_surfaces_command_failure_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_failing_bin(dir.path(), "fatal: no git repo");
+        let git = CliGit { bin };
+
+        let err = git.root(dir.path()).unwrap_err().to_string();
+
+        assert!(err.contains("git rev-parse failed"), "got: {err}");
+        assert!(err.contains("fatal: no git repo"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    fn write_recording_bin(dir: &Path, response: &str) -> PathBuf {
+        let argv = dir.join("argv.txt");
+        let resp = dir.join("response.txt");
+        fs::write(&resp, response).unwrap();
+        let script = format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {argv:?}\ncat {resp:?}\n");
+        write_script(dir.join("fake-bin"), &script)
+    }
+
+    #[cfg(unix)]
+    fn write_failing_bin(dir: &Path, stderr: &str) -> PathBuf {
+        let argv = dir.join("argv.txt");
+        let script =
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {argv:?}\necho {stderr:?} >&2\nexit 1\n");
+        write_script(dir.join("fake-bin-fail"), &script)
+    }
+
+    #[cfg(unix)]
+    fn recorded_args(dir: &Path) -> Vec<String> {
+        fs::read_to_string(dir.join("argv.txt"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn write_script(path: PathBuf, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&path, body).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+}
