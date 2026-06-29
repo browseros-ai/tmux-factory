@@ -14,6 +14,7 @@ use tempfile::TempDir;
 
 use tfmux::app::App;
 use tfmux::cli::Cli;
+use tfmux::git::{Git, GitHub, PullRequest};
 use tfmux::mux::{Mux, PaneRef};
 use tfmux::store::Store;
 use tfmux::target::Target;
@@ -33,6 +34,23 @@ struct MuxCalls {
     captured: Vec<(String, i32)>,
     has_sessions: Vec<String>,
     attached_windows: Vec<(String, String)>,
+    killed_sessions: Vec<String>,
+}
+
+#[derive(Clone, Default)]
+struct GitCalls {
+    roots: Vec<PathBuf>,
+    statuses: Vec<PathBuf>,
+    branches: Vec<PathBuf>,
+    fetches: Vec<(PathBuf, String, String)>,
+    pulls: Vec<(PathBuf, String, String)>,
+    ancestors: Vec<(PathBuf, String, String)>,
+    removed_worktrees: Vec<(PathBuf, PathBuf)>,
+}
+
+#[derive(Clone, Default)]
+struct GitHubCalls {
+    prs: Vec<(PathBuf, String)>,
 }
 
 /// Fake tmux: records each resolve call and returns a scripted pane (or error).
@@ -118,12 +136,135 @@ impl Mux for FakeMux {
             .push((session.to_string(), window_name.to_string()));
         Ok(())
     }
+
+    fn kill_session(&self, session: &str) -> anyhow::Result<()> {
+        self.calls
+            .borrow_mut()
+            .killed_sessions
+            .push(session.to_string());
+        Ok(())
+    }
+}
+
+/// Fake Git backend for `tfmux detach` command sequencing tests.
+struct FakeGit {
+    calls: Rc<RefCell<GitCalls>>,
+    repo_root: PathBuf,
+    worktree_root: PathBuf,
+    repo_status: String,
+    worktree_status: String,
+    repo_branch: String,
+    worktree_branch: String,
+    worktree_root_err: Option<String>,
+    remove_worktree_err: Option<String>,
+    ancestor_err: Option<String>,
+}
+
+impl Git for FakeGit {
+    fn root(&self, cwd: &Path) -> anyhow::Result<PathBuf> {
+        self.calls.borrow_mut().roots.push(cwd.to_path_buf());
+        if cwd == self.repo_root {
+            return Ok(self.repo_root.clone());
+        }
+        if cwd == self.worktree_root {
+            if let Some(err) = &self.worktree_root_err {
+                anyhow::bail!("{err}");
+            }
+            return Ok(self.worktree_root.clone());
+        }
+        anyhow::bail!("not a git repository: {}", cwd.display())
+    }
+
+    fn status_porcelain(&self, cwd: &Path) -> anyhow::Result<String> {
+        self.calls.borrow_mut().statuses.push(cwd.to_path_buf());
+        if cwd == self.repo_root {
+            return Ok(self.repo_status.clone());
+        }
+        if cwd == self.worktree_root {
+            return Ok(self.worktree_status.clone());
+        }
+        anyhow::bail!("not a git repository: {}", cwd.display())
+    }
+
+    fn current_branch(&self, cwd: &Path) -> anyhow::Result<String> {
+        self.calls.borrow_mut().branches.push(cwd.to_path_buf());
+        if cwd == self.repo_root {
+            return Ok(self.repo_branch.clone());
+        }
+        if cwd == self.worktree_root {
+            return Ok(self.worktree_branch.clone());
+        }
+        anyhow::bail!("not a git repository: {}", cwd.display())
+    }
+
+    fn fetch(&self, repo: &Path, remote: &str, main: &str) -> anyhow::Result<()> {
+        self.calls.borrow_mut().fetches.push((
+            repo.to_path_buf(),
+            remote.to_string(),
+            main.to_string(),
+        ));
+        Ok(())
+    }
+
+    fn pull_ff_only(&self, repo: &Path, remote: &str, main: &str) -> anyhow::Result<()> {
+        self.calls.borrow_mut().pulls.push((
+            repo.to_path_buf(),
+            remote.to_string(),
+            main.to_string(),
+        ));
+        Ok(())
+    }
+
+    fn merge_base_is_ancestor(
+        &self,
+        repo: &Path,
+        ancestor: &str,
+        descendant: &str,
+    ) -> anyhow::Result<()> {
+        self.calls.borrow_mut().ancestors.push((
+            repo.to_path_buf(),
+            ancestor.to_string(),
+            descendant.to_string(),
+        ));
+        if let Some(err) = &self.ancestor_err {
+            anyhow::bail!("{err}");
+        }
+        Ok(())
+    }
+
+    fn remove_worktree(&self, repo: &Path, worktree: &Path) -> anyhow::Result<()> {
+        self.calls
+            .borrow_mut()
+            .removed_worktrees
+            .push((repo.to_path_buf(), worktree.to_path_buf()));
+        if let Some(err) = &self.remove_worktree_err {
+            anyhow::bail!("{err}");
+        }
+        Ok(())
+    }
+}
+
+/// Fake GitHub backend for PR-state checks.
+struct FakeGitHub {
+    calls: Rc<RefCell<GitHubCalls>>,
+    pr: PullRequest,
+}
+
+impl GitHub for FakeGitHub {
+    fn pull_request(&self, repo: &Path, pr: &str) -> anyhow::Result<PullRequest> {
+        self.calls
+            .borrow_mut()
+            .prs
+            .push((repo.to_path_buf(), pr.to_string()));
+        Ok(self.pr.clone())
+    }
 }
 
 /// Builder + driver for a single bind invocation.
 struct Scenario {
     home: TempDir,
     cwd: TempDir,
+    worktree: TempDir,
     env: HashMap<String, String>,
     pane: PaneRef,
     resolve_err: Option<String>,
@@ -134,6 +275,16 @@ struct Scenario {
     captures: Rc<RefCell<VecDeque<String>>>,
     sleeps: Rc<Cell<u32>>,
     calls: Rc<RefCell<MuxCalls>>,
+    git_calls: Rc<RefCell<GitCalls>>,
+    github_calls: Rc<RefCell<GitHubCalls>>,
+    repo_status: String,
+    worktree_status: String,
+    repo_branch: String,
+    worktree_branch: String,
+    worktree_root_err: Option<String>,
+    remove_worktree_err: Option<String>,
+    ancestor_err: Option<String>,
+    pr: PullRequest,
 }
 
 impl Scenario {
@@ -141,6 +292,7 @@ impl Scenario {
         Scenario {
             home: tempfile::tempdir().unwrap(),
             cwd: tempfile::tempdir().unwrap(),
+            worktree: tempfile::tempdir().unwrap(),
             env: HashMap::new(),
             pane: PaneRef {
                 input: String::new(),
@@ -157,6 +309,23 @@ impl Scenario {
             captures: Rc::new(RefCell::new(VecDeque::from(["submitted\n".to_string()]))),
             sleeps: Rc::new(Cell::new(0)),
             calls: Rc::new(RefCell::new(MuxCalls::default())),
+            git_calls: Rc::new(RefCell::new(GitCalls::default())),
+            github_calls: Rc::new(RefCell::new(GitHubCalls::default())),
+            repo_status: String::new(),
+            worktree_status: String::new(),
+            repo_branch: "main".to_string(),
+            worktree_branch: "feat/demo".to_string(),
+            worktree_root_err: None,
+            remove_worktree_err: None,
+            ancestor_err: None,
+            pr: PullRequest {
+                state: "MERGED".to_string(),
+                merged_at: Some("2026-06-28T20:00:00Z".to_string()),
+                merge_commit: Some("abc123".to_string()),
+                head_ref_name: "feat/demo".to_string(),
+                base_ref_name: "main".to_string(),
+                url: "https://github.com/example/repo/pull/12".to_string(),
+            },
         }
     }
 
@@ -186,6 +355,62 @@ impl Scenario {
         self
     }
 
+    fn worktree_status(mut self, status: &str) -> Self {
+        self.worktree_status = status.to_string();
+        self
+    }
+
+    fn repo_status(mut self, status: &str) -> Self {
+        self.repo_status = status.to_string();
+        self
+    }
+
+    fn repo_branch(mut self, branch: &str) -> Self {
+        self.repo_branch = branch.to_string();
+        self
+    }
+
+    fn worktree_branch(mut self, branch: &str) -> Self {
+        self.worktree_branch = branch.to_string();
+        self.pr.head_ref_name = branch.to_string();
+        self
+    }
+
+    fn worktree_root_err(mut self, msg: &str) -> Self {
+        self.worktree_root_err = Some(msg.to_string());
+        self
+    }
+
+    fn remove_worktree_err(mut self, msg: &str) -> Self {
+        self.remove_worktree_err = Some(msg.to_string());
+        self
+    }
+
+    fn ancestor_err(mut self, msg: &str) -> Self {
+        self.ancestor_err = Some(msg.to_string());
+        self
+    }
+
+    fn pr_state(mut self, state: &str) -> Self {
+        self.pr.state = state.to_string();
+        self
+    }
+
+    fn pr_base(mut self, base: &str) -> Self {
+        self.pr.base_ref_name = base.to_string();
+        self
+    }
+
+    fn pr_head(mut self, head: &str) -> Self {
+        self.pr.head_ref_name = head.to_string();
+        self
+    }
+
+    fn pr_merge_commit(mut self, merge_commit: Option<&str>) -> Self {
+        self.pr.merge_commit = merge_commit.map(str::to_string);
+        self
+    }
+
     fn resolve_override(
         mut self,
         target: &str,
@@ -208,6 +433,22 @@ impl Scenario {
 
     fn home(&self) -> &Path {
         self.home.path()
+    }
+
+    fn repo(&self) -> PathBuf {
+        self.cwd.path().canonicalize().unwrap()
+    }
+
+    fn worktree(&self) -> PathBuf {
+        self.worktree.path().canonicalize().unwrap()
+    }
+
+    fn worktree_arg(&self) -> String {
+        self.worktree().display().to_string()
+    }
+
+    fn repo_arg(&self) -> String {
+        self.repo().display().to_string()
     }
 
     fn built(&self) -> u32 {
@@ -240,6 +481,18 @@ impl Scenario {
 
     fn attached_windows(&self) -> Vec<(String, String)> {
         self.calls.borrow().attached_windows.clone()
+    }
+
+    fn killed_sessions(&self) -> Vec<String> {
+        self.calls.borrow().killed_sessions.clone()
+    }
+
+    fn git_calls(&self) -> GitCalls {
+        self.git_calls.borrow().clone()
+    }
+
+    fn github_calls(&self) -> GitHubCalls {
+        self.github_calls.borrow().clone()
     }
 
     fn sleeps(&self) -> u32 {
@@ -321,6 +574,38 @@ impl Scenario {
                 captures: captures.clone(),
             }))
         };
+        let git_calls = self.git_calls.clone();
+        let repo_root = self.repo();
+        let worktree_root = self.worktree();
+        let repo_status = self.repo_status.clone();
+        let worktree_status = self.worktree_status.clone();
+        let repo_branch = self.repo_branch.clone();
+        let worktree_branch = self.worktree_branch.clone();
+        let worktree_root_err = self.worktree_root_err.clone();
+        let remove_worktree_err = self.remove_worktree_err.clone();
+        let ancestor_err = self.ancestor_err.clone();
+        let new_git = move || -> anyhow::Result<Box<dyn Git>> {
+            Ok(Box::new(FakeGit {
+                calls: git_calls.clone(),
+                repo_root: repo_root.clone(),
+                worktree_root: worktree_root.clone(),
+                repo_status: repo_status.clone(),
+                worktree_status: worktree_status.clone(),
+                repo_branch: repo_branch.clone(),
+                worktree_branch: worktree_branch.clone(),
+                worktree_root_err: worktree_root_err.clone(),
+                remove_worktree_err: remove_worktree_err.clone(),
+                ancestor_err: ancestor_err.clone(),
+            }))
+        };
+        let github_calls = self.github_calls.clone();
+        let pr = self.pr.clone();
+        let new_github = move || -> anyhow::Result<Box<dyn GitHub>> {
+            Ok(Box::new(FakeGitHub {
+                calls: github_calls.clone(),
+                pr: pr.clone(),
+            }))
+        };
         let stdin = self.stdin.clone();
         let read_stdin = move || -> anyhow::Result<String> { Ok(stdin.clone()) };
         let buffer_name = self.buffer_name.clone();
@@ -338,6 +623,8 @@ impl Scenario {
             cwd: self.cwd.path().to_path_buf(),
             now: &now_fn,
             new_mux: &new_mux,
+            new_git: &new_git,
+            new_github: &new_github,
             read_stdin: &read_stdin,
             new_buffer_name: &new_buffer_name,
             sleep: &sleep,
@@ -479,6 +766,30 @@ fn attach_real_binary_outside_tmux_does_not_require_home() {
 }
 
 #[test]
+fn detach_real_binary_validation_does_not_require_home() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tfmux"))
+        .args([
+            "detach",
+            "worker",
+            "--worktree",
+            "/tmp/tfmux-detach-missing-worktree",
+            "--pr",
+            "12",
+        ])
+        .env_remove("HOME")
+        .env_remove("TFMUX_HOME")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "error: --worktree /tmp/tfmux-detach-missing-worktree does not exist\n"
+    );
+}
+
+#[test]
 fn attach_blank_session_errors_before_building_mux_or_writing_state() {
     let s = Scenario::new().env("TMUX", "/tmp/tmux-501/default,1234,0");
 
@@ -518,6 +829,436 @@ fn attach_missing_tmux_session_propagates_has_session_failure() {
     assert_eq!(s.has_sessions(), vec!["worker".to_string()]);
     assert!(s.attached_windows().is_empty());
     assert_eq!(s.home_entry_count(), 0);
+}
+
+#[test]
+fn detach_success_updates_main_removes_worktree_then_kills_tmux() {
+    let s = Scenario::new();
+    let worktree = s.worktree_arg();
+    let repo = s.repo_arg();
+
+    let (result, stdout) = s.run(&[
+        "tfmux",
+        "detach",
+        "worker",
+        "--worktree",
+        &worktree,
+        "--repo",
+        &repo,
+        "--pr",
+        "12",
+    ]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(
+        stdout,
+        format!(
+            "detached \"worker\"\nworktree removed: {worktree}\nmain updated: origin/main\npr verified: https://github.com/example/repo/pull/12\nbranch kept: feat/demo\n"
+        )
+    );
+    assert_eq!(s.has_sessions(), vec!["worker".to_string()]);
+    assert_eq!(s.killed_sessions(), vec!["worker".to_string()]);
+
+    let git = s.git_calls();
+    assert_eq!(
+        git.fetches,
+        vec![(s.repo(), "origin".to_string(), "main".to_string())]
+    );
+    assert_eq!(
+        git.pulls,
+        vec![(s.repo(), "origin".to_string(), "main".to_string())]
+    );
+    assert_eq!(
+        git.ancestors,
+        vec![(s.repo(), "abc123".to_string(), "main".to_string())]
+    );
+    assert_eq!(git.removed_worktrees, vec![(s.repo(), s.worktree())]);
+
+    let github = s.github_calls();
+    assert_eq!(github.prs, vec![(s.repo(), "12".to_string())]);
+}
+
+#[test]
+fn detach_dry_run_prints_plan_without_destructive_actions() {
+    let s = Scenario::new();
+    let worktree = s.worktree_arg();
+    let repo = s.repo_arg();
+
+    let (result, stdout) = s.run(&[
+        "tfmux",
+        "detach",
+        "worker",
+        "--worktree",
+        &worktree,
+        "--repo",
+        &repo,
+        "--pr",
+        "12",
+        "--dry-run",
+    ]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(
+        stdout,
+        format!(
+            "dry run: would detach \"worker\"\nwould verify PR 12 is merged into main\nwould fetch origin main in {repo}\nwould pull --ff-only origin main in {repo}\nwould remove worktree {worktree}\nwould kill tmux session worker\n"
+        )
+    );
+    assert_eq!(s.has_sessions(), vec!["worker".to_string()]);
+    assert!(s.killed_sessions().is_empty());
+
+    let git = s.git_calls();
+    assert!(git.fetches.is_empty());
+    assert!(git.pulls.is_empty());
+    assert!(git.removed_worktrees.is_empty());
+}
+
+#[test]
+fn detach_rejects_dirty_worktree_before_pr_or_destructive_actions() {
+    let s = Scenario::new().worktree_status(" M src/lib.rs\n?? scratch.txt\n");
+    let worktree = s.worktree_arg();
+    let repo = s.repo_arg();
+
+    let (result, _) = s.run(&[
+        "tfmux",
+        "detach",
+        "worker",
+        "--worktree",
+        &worktree,
+        "--repo",
+        &repo,
+        "--pr",
+        "12",
+    ]);
+
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("has uncommitted or untracked changes"),
+        "got: {err}"
+    );
+    assert!(
+        err.contains("commit, stash, or remove them before detach"),
+        "got: {err}"
+    );
+    assert!(s.github_calls().prs.is_empty());
+    let git = s.git_calls();
+    assert!(git.fetches.is_empty());
+    assert!(git.pulls.is_empty());
+    assert!(git.removed_worktrees.is_empty());
+    assert!(s.killed_sessions().is_empty());
+}
+
+#[test]
+fn detach_rejects_unmerged_pr_before_fetch_or_cleanup() {
+    let s = Scenario::new().pr_state("OPEN");
+    let worktree = s.worktree_arg();
+    let repo = s.repo_arg();
+
+    let (result, _) = s.run(&[
+        "tfmux",
+        "detach",
+        "worker",
+        "--worktree",
+        &worktree,
+        "--repo",
+        &repo,
+        "--pr",
+        "12",
+    ]);
+
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("PR 12 is OPEN, not MERGED"), "got: {err}");
+    let git = s.git_calls();
+    assert!(git.fetches.is_empty());
+    assert!(git.pulls.is_empty());
+    assert!(git.removed_worktrees.is_empty());
+    assert!(s.killed_sessions().is_empty());
+}
+
+#[test]
+fn detach_rejects_repo_not_on_main_before_pr_or_cleanup() {
+    let s = Scenario::new().repo_branch("feat/other");
+    let worktree = s.worktree_arg();
+    let repo = s.repo_arg();
+
+    let (result, _) = s.run(&[
+        "tfmux",
+        "detach",
+        "worker",
+        "--worktree",
+        &worktree,
+        "--repo",
+        &repo,
+        "--pr",
+        "12",
+    ]);
+
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("is on branch feat/other, not main"),
+        "got: {err}"
+    );
+    assert!(s.github_calls().prs.is_empty());
+    assert!(s.git_calls().removed_worktrees.is_empty());
+    assert!(s.killed_sessions().is_empty());
+}
+
+#[test]
+fn detach_rejects_repo_and_worktree_resolving_to_same_checkout() {
+    let s = Scenario::new();
+    let worktree = s.worktree_arg();
+
+    let (result, _) = s.run(&[
+        "tfmux",
+        "detach",
+        "worker",
+        "--worktree",
+        &worktree,
+        "--repo",
+        &worktree,
+        "--pr",
+        "12",
+    ]);
+
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("--repo and --worktree both resolve to"),
+        "got: {err}"
+    );
+    assert!(
+        err.contains("run from the main checkout or pass --repo PATH"),
+        "got: {err}"
+    );
+    assert!(s.github_calls().prs.is_empty());
+    assert!(s.git_calls().removed_worktrees.is_empty());
+    assert!(s.killed_sessions().is_empty());
+}
+
+#[test]
+fn detach_rejects_dirty_main_checkout_before_pr_or_cleanup() {
+    let s = Scenario::new().repo_status(" M README.md\n");
+    let worktree = s.worktree_arg();
+    let repo = s.repo_arg();
+
+    let (result, _) = s.run(&[
+        "tfmux",
+        "detach",
+        "worker",
+        "--worktree",
+        &worktree,
+        "--repo",
+        &repo,
+        "--pr",
+        "12",
+    ]);
+
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("repo main checkout") && err.contains("has uncommitted"),
+        "got: {err}"
+    );
+    assert!(s.github_calls().prs.is_empty());
+    assert!(s.git_calls().removed_worktrees.is_empty());
+    assert!(s.killed_sessions().is_empty());
+}
+
+#[test]
+fn detach_rejects_non_git_worktree_before_pr_or_cleanup() {
+    let s = Scenario::new().worktree_root_err("not a git repository");
+    let worktree = s.worktree_arg();
+    let repo = s.repo_arg();
+
+    let (result, _) = s.run(&[
+        "tfmux",
+        "detach",
+        "worker",
+        "--worktree",
+        &worktree,
+        "--repo",
+        &repo,
+        "--pr",
+        "12",
+    ]);
+
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("not a git repository"), "got: {err}");
+    assert!(s.github_calls().prs.is_empty());
+    assert!(s.git_calls().removed_worktrees.is_empty());
+    assert!(s.killed_sessions().is_empty());
+}
+
+#[test]
+fn detach_rejects_explicit_branch_mismatch_before_pr_or_cleanup() {
+    let s = Scenario::new().worktree_branch("feat/actual");
+    let worktree = s.worktree_arg();
+    let repo = s.repo_arg();
+
+    let (result, _) = s.run(&[
+        "tfmux",
+        "detach",
+        "worker",
+        "--worktree",
+        &worktree,
+        "--repo",
+        &repo,
+        "--branch",
+        "feat/expected",
+        "--pr",
+        "12",
+    ]);
+
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("worktree is on branch feat/actual, not feat/expected"),
+        "got: {err}"
+    );
+    assert!(s.github_calls().prs.is_empty());
+    assert!(s.git_calls().removed_worktrees.is_empty());
+    assert!(s.killed_sessions().is_empty());
+}
+
+#[test]
+fn detach_rejects_pr_base_mismatch_before_fetch_or_cleanup() {
+    let s = Scenario::new().pr_base("develop");
+    let worktree = s.worktree_arg();
+    let repo = s.repo_arg();
+
+    let (result, _) = s.run(&[
+        "tfmux",
+        "detach",
+        "worker",
+        "--worktree",
+        &worktree,
+        "--repo",
+        &repo,
+        "--pr",
+        "12",
+    ]);
+
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("targets develop, not main"), "got: {err}");
+    let git = s.git_calls();
+    assert!(git.fetches.is_empty());
+    assert!(git.pulls.is_empty());
+    assert!(git.removed_worktrees.is_empty());
+    assert!(s.killed_sessions().is_empty());
+}
+
+#[test]
+fn detach_rejects_pr_head_mismatch_before_fetch_or_cleanup() {
+    let s = Scenario::new().pr_head("feat/other");
+    let worktree = s.worktree_arg();
+    let repo = s.repo_arg();
+
+    let (result, _) = s.run(&[
+        "tfmux",
+        "detach",
+        "worker",
+        "--worktree",
+        &worktree,
+        "--repo",
+        &repo,
+        "--pr",
+        "12",
+    ]);
+
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("head branch is feat/other, not feat/demo"),
+        "got: {err}"
+    );
+    assert!(s.git_calls().removed_worktrees.is_empty());
+    assert!(s.killed_sessions().is_empty());
+}
+
+#[test]
+fn detach_rejects_pr_without_merge_commit_before_fetch_or_cleanup() {
+    let s = Scenario::new().pr_merge_commit(None);
+    let worktree = s.worktree_arg();
+    let repo = s.repo_arg();
+
+    let (result, _) = s.run(&[
+        "tfmux",
+        "detach",
+        "worker",
+        "--worktree",
+        &worktree,
+        "--repo",
+        &repo,
+        "--pr",
+        "12",
+    ]);
+
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("has no merge commit"), "got: {err}");
+    let git = s.git_calls();
+    assert!(git.fetches.is_empty());
+    assert!(git.pulls.is_empty());
+    assert!(git.removed_worktrees.is_empty());
+    assert!(s.killed_sessions().is_empty());
+}
+
+#[test]
+fn detach_rejects_merge_commit_not_on_main_after_update() {
+    let s = Scenario::new().ancestor_err("not an ancestor");
+    let worktree = s.worktree_arg();
+    let repo = s.repo_arg();
+
+    let (result, _) = s.run(&[
+        "tfmux",
+        "detach",
+        "worker",
+        "--worktree",
+        &worktree,
+        "--repo",
+        &repo,
+        "--pr",
+        "12",
+    ]);
+
+    let err = format!("{:#}", result.unwrap_err());
+    assert!(
+        err.contains("PR merge commit abc123 is not on main"),
+        "got: {err}"
+    );
+    assert!(err.contains("not an ancestor"), "got: {err}");
+    let git = s.git_calls();
+    assert_eq!(
+        git.fetches,
+        vec![(s.repo(), "origin".to_string(), "main".to_string())]
+    );
+    assert_eq!(
+        git.pulls,
+        vec![(s.repo(), "origin".to_string(), "main".to_string())]
+    );
+    assert!(git.removed_worktrees.is_empty());
+    assert!(s.killed_sessions().is_empty());
+}
+
+#[test]
+fn detach_worktree_remove_failure_does_not_kill_tmux() {
+    let s = Scenario::new().remove_worktree_err("worktree contains locked files");
+    let worktree = s.worktree_arg();
+    let repo = s.repo_arg();
+
+    let (result, _) = s.run(&[
+        "tfmux",
+        "detach",
+        "worker",
+        "--worktree",
+        &worktree,
+        "--repo",
+        &repo,
+        "--pr",
+        "12",
+    ]);
+
+    let err = format!("{:#}", result.unwrap_err());
+    assert!(err.contains("removing worktree"), "got: {err}");
+    assert!(err.contains("worktree contains locked files"), "got: {err}");
+    let git = s.git_calls();
+    assert_eq!(git.removed_worktrees, vec![(s.repo(), s.worktree())]);
+    assert!(s.killed_sessions().is_empty());
 }
 
 #[test]

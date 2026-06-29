@@ -1,5 +1,6 @@
 pub mod app;
 pub mod cli;
+pub mod git;
 pub mod mux;
 pub mod store;
 pub mod target;
@@ -15,6 +16,7 @@ pub fn run(app: &mut App, cli: Cli) -> Result<()> {
         Command::Bind(args) => cli::bind(app, &args),
         Command::Send(args) => cli::send(app, &args),
         Command::Attach(args) => cli::attach(app, &args),
+        Command::Detach(args) => cli::detach(app, &args),
         Command::Unbind(args) => cli::unbind(app, &args),
         Command::Targets(args) => cli::targets(app, &args),
     }
