@@ -379,8 +379,342 @@ fn strip_ansi(text: &str) -> String {
     stripped
 }
 
+/// Handle `tfmux bind`: resolve the session and tmux pane, then persist the
+/// target. Validation and argument errors fail before any state is written.
+///
+/// # Errors
+/// Returns an error on an invalid name/role/kind, when not exactly one of
+/// `--here`/`--tmux` is given, when no session name resolves, or when tmux
+/// cannot resolve the pane.
+pub fn bind(app: &mut App, args: &BindArgs) -> Result<()> {
+    validate_name(&args.name)?;
+    validate_role(&args.role)?;
+    validate_kind(&args.kind)?;
+
+    // Exactly one target source. A blank `--tmux ""` counts as absent.
+    let tmux_target = args
+        .tmux
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if args.here == tmux_target.is_some() {
+        bail!("choose exactly one target source: --here or --tmux TARGET");
+    }
+
+    let env_session = (app.env)("TFMUX_SESSION");
+    // Resolve the session name (read-only; precedence + path-safe validation).
+    let marker = if has_flag_or_env_session(args.session.as_deref(), env_session.as_deref()) {
+        None
+    } else {
+        store::read_session_marker(&app.cwd)?
+    };
+    let session_name = store::resolve_session_name(
+        args.session.as_deref(),
+        env_session.as_deref(),
+        marker.as_deref(),
+    )?;
+
+    // Resolve the tmux input string. For `--here` this validates the tmux env
+    // *before* the mux is built, so that failure path never shells out.
+    let input = if args.here {
+        let in_tmux = (app.env)("TMUX")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        if in_tmux.is_none() {
+            bail!("--here requires TMUX and TMUX_PANE; run from inside tmux or use --tmux TARGET");
+        }
+        match (app.env)("TMUX_PANE")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            Some(pane) => pane,
+            None => bail!("inside tmux but TMUX_PANE is empty; use --tmux TARGET"),
+        }
+    } else {
+        tmux_target
+            .expect("xor check guarantees a tmux target")
+            .to_string()
+    };
+
+    // Look up an existing session before doing anything that writes.
+    let store = Store::new(app.base_dir.clone());
+    let existing = store.find_session_dir(&session_name)?;
+
+    // Build the mux only now, then resolve the canonical pane.
+    let mux = (app.new_mux)()?;
+    let pane = mux.resolve_pane(&input)?;
+
+    let now = (app.now)();
+    let target = Target {
+        name: args.name.clone(),
+        role: args.role.clone(),
+        kind: args.kind.clone(),
+        input,
+        pane_id: pane.pane_id,
+        session: pane.session,
+        window: pane.window,
+        pane_index: pane.pane_index,
+        bound_at: rfc3339(now),
+    };
+
+    // Writes: create the session on first bind, then save the target.
+    let session_dir = match existing {
+        Some(dir) => dir,
+        None => store.create_session(&session_name, now)?,
+    };
+    store.save_target(&session_dir, &target)?;
+
+    if args.json {
+        writeln!(app.out, "{}", serde_json::to_string_pretty(&target)?)?;
+    } else {
+        writeln!(
+            app.out,
+            "bound {} -> {} ({}:{}.{})",
+            target.name, target.pane_id, target.session, target.window, target.pane_index
+        )?;
+    }
+    Ok(())
+}
+
+/// Handle `tfmux send`: resolve a payload and existing target, deliver it, and
+/// print the verified byte count.
+///
+/// # Errors
+/// Returns an error on invalid names/input, missing sessions or targets, tmux
+/// failures, or verification failures.
+pub fn send(app: &mut App, args: &SendArgs) -> Result<()> {
+    validate_name(&args.name)?;
+    let payload = resolve_send_payload(args, app.read_stdin)?;
+
+    let env_session = (app.env)("TFMUX_SESSION");
+    let marker = if has_flag_or_env_session(args.session.as_deref(), env_session.as_deref()) {
+        None
+    } else {
+        store::read_session_marker(&app.cwd)?
+    };
+    let session_name = resolve_send_session_name(
+        args.session.as_deref(),
+        env_session.as_deref(),
+        marker.as_deref(),
+    )?;
+
+    let store = Store::new(app.base_dir.clone());
+    let session_dir = store
+        .find_session_dir(&session_name)?
+        .ok_or_else(|| missing_send_session(&session_name))?;
+    let target = store
+        .load_target(&session_dir, &args.name)?
+        .ok_or_else(|| {
+            anyhow!(
+                "no target \"{}\" in session {}; run `tfmux bind {} ...`",
+                args.name,
+                session_name,
+                args.name
+            )
+        })?;
+
+    let mux = (app.new_mux)()?;
+    let buffer_name = (app.new_buffer_name)();
+    let sent = deliver_payload(mux.as_ref(), &target, &payload, &buffer_name, app.sleep)?;
+    writeln!(
+        app.out,
+        "sent {} bytes to \"{}\" ({})",
+        sent.bytes, target.name, sent.pane_id
+    )?;
+    Ok(())
+}
+
+/// Handle `tfmux attach`: open a detached tmux session in a new window of the
+/// current tmux client without reading or writing tfmux state.
+///
+/// # Errors
+/// Returns an error when the session/window arguments are blank, the command is
+/// not run from inside tmux, the target tmux session is missing, or tmux cannot
+/// create the new window.
+pub fn attach(app: &mut App, args: &AttachArgs) -> Result<()> {
+    let tmux_session = args.tmux_session.as_str();
+    if tmux_session.trim().is_empty() {
+        bail!("tmux session is required");
+    }
+
+    let window_name = match args.window_name.as_deref() {
+        Some(name) => {
+            if name.trim().is_empty() {
+                bail!("--window-name requires a non-empty value");
+            }
+            name
+        }
+        None => tmux_session,
+    };
+
+    let in_tmux = (app.env)("TMUX")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if in_tmux.is_none() {
+        bail!("attach requires TMUX; run from inside tmux");
+    }
+
+    let mux = (app.new_mux)()?;
+    mux.has_session(tmux_session)?;
+    mux.attach_session_in_new_window(tmux_session, window_name)?;
+    writeln!(
+        app.out,
+        "attached \"{}\" in new window \"{}\"",
+        tmux_session, window_name
+    )?;
+    Ok(())
+}
+
+/// Handle `tfmux unbind`: remove one target file from an existing session.
+///
+/// # Errors
+/// Returns an error on invalid names, missing session selection, missing
+/// sessions, missing targets, or filesystem deletion failures.
+pub fn unbind(app: &mut App, args: &UnbindArgs) -> Result<()> {
+    validate_name(&args.name)?;
+
+    let env_session = (app.env)("TFMUX_SESSION");
+    let marker = if has_flag_or_env_session(args.session.as_deref(), env_session.as_deref()) {
+        None
+    } else {
+        store::read_session_marker(&app.cwd)?
+    };
+    let session_name = resolve_send_session_name(
+        args.session.as_deref(),
+        env_session.as_deref(),
+        marker.as_deref(),
+    )?;
+
+    let store = Store::new(app.base_dir.clone());
+    let session_dir = store
+        .find_session_dir(&session_name)?
+        .ok_or_else(|| anyhow!("no tfmux session \"{session_name}\""))?;
+    if !store.delete_target(&session_dir, &args.name)? {
+        bail!("no target \"{}\" in session {}", args.name, session_name);
+    }
+
+    if args.json {
+        let output = UnbindOutput {
+            session: &session_name,
+            name: &args.name,
+            removed: true,
+        };
+        writeln!(app.out, "{}", serde_json::to_string_pretty(&output)?)?;
+    } else {
+        writeln!(
+            app.out,
+            "unbound \"{}\" from session {}",
+            args.name, session_name
+        )?;
+    }
+    Ok(())
+}
+
+/// Handle `tfmux targets`: list bound targets in an existing session and show
+/// whether each stored pane still resolves to the same tmux metadata.
+///
+/// # Errors
+/// Returns an error when no session can be selected, the selected session does
+/// not exist, target files cannot be read, or tmux construction fails.
+pub fn targets(app: &mut App, args: &TargetsArgs) -> Result<()> {
+    let env_session = (app.env)("TFMUX_SESSION");
+    let marker = if has_flag_or_env_session(args.session.as_deref(), env_session.as_deref()) {
+        None
+    } else {
+        store::read_session_marker(&app.cwd)?
+    };
+    let session_name = resolve_send_session_name(
+        args.session.as_deref(),
+        env_session.as_deref(),
+        marker.as_deref(),
+    )?;
+
+    let store = Store::new(app.base_dir.clone());
+    let session_dir = store
+        .find_session_dir(&session_name)?
+        .ok_or_else(|| anyhow!("no tfmux session \"{session_name}\""))?;
+    let stored_targets = store.list_targets(&session_dir)?;
+    if stored_targets.is_empty() {
+        if args.json {
+            writeln!(app.out, "[]")?;
+        }
+        return Ok(());
+    }
+
+    let mux = (app.new_mux)()?;
+    let rows = stored_targets
+        .iter()
+        .map(|target| inspect_target_status(mux.as_ref(), target))
+        .collect::<Vec<_>>();
+    if args.json {
+        let json_rows = rows.iter().map(TargetStatusJson::from).collect::<Vec<_>>();
+        writeln!(app.out, "{}", serde_json::to_string_pretty(&json_rows)?)?;
+    } else {
+        write_targets_table(app, &rows)?;
+    }
+    Ok(())
+}
+
+fn write_targets_table(app: &mut App, rows: &[TargetStatusRow]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        app.out,
+        "{:<10} {:<8} {:<8} {:<6} {:<14} STATUS",
+        "NAME", "ROLE", "KIND", "PANE", "LOCATION"
+    )?;
+    for row in rows {
+        let location = format!(
+            "{}:{}.{}",
+            row.target.session, row.target.window, row.target.pane_index
+        );
+        writeln!(
+            app.out,
+            "{:<10} {:<8} {:<8} {:<6} {:<14} {}",
+            row.target.name,
+            row.target.role,
+            row.target.kind,
+            row.target.pane_id,
+            location,
+            row.status.as_str()
+        )?;
+    }
+    Ok(())
+}
+
+fn resolve_send_session_name(
+    flag: Option<&str>,
+    env: Option<&str>,
+    marker: Option<&str>,
+) -> Result<String> {
+    for candidate in [flag, env, marker] {
+        if let Some(name) = candidate.map(str::trim).filter(|s| !s.is_empty()) {
+            validate_name(name)?;
+            return Ok(name.to_string());
+        }
+    }
+    Err(no_send_session_selected())
+}
+
+fn has_flag_or_env_session(flag: Option<&str>, env: Option<&str>) -> bool {
+    [flag, env]
+        .into_iter()
+        .flatten()
+        .any(|candidate| !candidate.trim().is_empty())
+}
+
+fn no_send_session_selected() -> anyhow::Error {
+    anyhow!("no tfmux session selected; pass --session NAME, set TFMUX_SESSION, or add .llm/tfmux-session")
+}
+
+fn missing_send_session(session_name: &str) -> anyhow::Error {
+    anyhow!(
+        "tfmux session \"{session_name}\" not found; run `tfmux bind <name> ... --session {session_name}` first"
+    )
+}
+
 #[cfg(test)]
-#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use anyhow::Result;
@@ -808,339 +1142,4 @@ mod tests {
         );
         assert_eq!(row.error, None);
     }
-}
-
-/// Handle `tfmux bind`: resolve the session and tmux pane, then persist the
-/// target. Validation and argument errors fail before any state is written.
-///
-/// # Errors
-/// Returns an error on an invalid name/role/kind, when not exactly one of
-/// `--here`/`--tmux` is given, when no session name resolves, or when tmux
-/// cannot resolve the pane.
-pub fn bind(app: &mut App, args: &BindArgs) -> Result<()> {
-    validate_name(&args.name)?;
-    validate_role(&args.role)?;
-    validate_kind(&args.kind)?;
-
-    // Exactly one target source. A blank `--tmux ""` counts as absent.
-    let tmux_target = args
-        .tmux
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    if args.here == tmux_target.is_some() {
-        bail!("choose exactly one target source: --here or --tmux TARGET");
-    }
-
-    let env_session = (app.env)("TFMUX_SESSION");
-    // Resolve the session name (read-only; precedence + path-safe validation).
-    let marker = if has_flag_or_env_session(args.session.as_deref(), env_session.as_deref()) {
-        None
-    } else {
-        store::read_session_marker(&app.cwd)?
-    };
-    let session_name = store::resolve_session_name(
-        args.session.as_deref(),
-        env_session.as_deref(),
-        marker.as_deref(),
-    )?;
-
-    // Resolve the tmux input string. For `--here` this validates the tmux env
-    // *before* the mux is built, so that failure path never shells out.
-    let input = if args.here {
-        let in_tmux = (app.env)("TMUX")
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        if in_tmux.is_none() {
-            bail!("--here requires TMUX and TMUX_PANE; run from inside tmux or use --tmux TARGET");
-        }
-        match (app.env)("TMUX_PANE")
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-        {
-            Some(pane) => pane,
-            None => bail!("inside tmux but TMUX_PANE is empty; use --tmux TARGET"),
-        }
-    } else {
-        tmux_target
-            .expect("xor check guarantees a tmux target")
-            .to_string()
-    };
-
-    // Look up an existing session before doing anything that writes.
-    let store = Store::new(app.base_dir.clone());
-    let existing = store.find_session_dir(&session_name)?;
-
-    // Build the mux only now, then resolve the canonical pane.
-    let mux = (app.new_mux)()?;
-    let pane = mux.resolve_pane(&input)?;
-
-    let now = (app.now)();
-    let target = Target {
-        name: args.name.clone(),
-        role: args.role.clone(),
-        kind: args.kind.clone(),
-        input,
-        pane_id: pane.pane_id,
-        session: pane.session,
-        window: pane.window,
-        pane_index: pane.pane_index,
-        bound_at: rfc3339(now),
-    };
-
-    // Writes: create the session on first bind, then save the target.
-    let session_dir = match existing {
-        Some(dir) => dir,
-        None => store.create_session(&session_name, now)?,
-    };
-    store.save_target(&session_dir, &target)?;
-
-    if args.json {
-        writeln!(app.out, "{}", serde_json::to_string_pretty(&target)?)?;
-    } else {
-        writeln!(
-            app.out,
-            "bound {} -> {} ({}:{}.{})",
-            target.name, target.pane_id, target.session, target.window, target.pane_index
-        )?;
-    }
-    Ok(())
-}
-
-/// Handle `tfmux send`: resolve a payload and existing target, deliver it, and
-/// print the verified byte count.
-///
-/// # Errors
-/// Returns an error on invalid names/input, missing sessions or targets, tmux
-/// failures, or verification failures.
-pub fn send(app: &mut App, args: &SendArgs) -> Result<()> {
-    validate_name(&args.name)?;
-    let payload = resolve_send_payload(args, app.read_stdin)?;
-
-    let env_session = (app.env)("TFMUX_SESSION");
-    let marker = if has_flag_or_env_session(args.session.as_deref(), env_session.as_deref()) {
-        None
-    } else {
-        store::read_session_marker(&app.cwd)?
-    };
-    let session_name = resolve_send_session_name(
-        args.session.as_deref(),
-        env_session.as_deref(),
-        marker.as_deref(),
-    )?;
-
-    let store = Store::new(app.base_dir.clone());
-    let session_dir = store
-        .find_session_dir(&session_name)?
-        .ok_or_else(|| missing_send_session(&session_name))?;
-    let target = store
-        .load_target(&session_dir, &args.name)?
-        .ok_or_else(|| {
-            anyhow!(
-                "no target \"{}\" in session {}; run `tfmux bind {} ...`",
-                args.name,
-                session_name,
-                args.name
-            )
-        })?;
-
-    let mux = (app.new_mux)()?;
-    let buffer_name = (app.new_buffer_name)();
-    let sent = deliver_payload(mux.as_ref(), &target, &payload, &buffer_name, app.sleep)?;
-    writeln!(
-        app.out,
-        "sent {} bytes to \"{}\" ({})",
-        sent.bytes, target.name, sent.pane_id
-    )?;
-    Ok(())
-}
-
-/// Handle `tfmux attach`: open a detached tmux session in a new window of the
-/// current tmux client without reading or writing tfmux state.
-///
-/// # Errors
-/// Returns an error when the session/window arguments are blank, the command is
-/// not run from inside tmux, the target tmux session is missing, or tmux cannot
-/// create the new window.
-pub fn attach(app: &mut App, args: &AttachArgs) -> Result<()> {
-    let tmux_session = args.tmux_session.as_str();
-    if tmux_session.trim().is_empty() {
-        bail!("tmux session is required");
-    }
-
-    let window_name = match args.window_name.as_deref() {
-        Some(name) => {
-            if name.trim().is_empty() {
-                bail!("--window-name requires a non-empty value");
-            }
-            name
-        }
-        None => tmux_session,
-    };
-
-    let in_tmux = (app.env)("TMUX")
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    if in_tmux.is_none() {
-        bail!("attach requires TMUX; run from inside tmux");
-    }
-
-    let mux = (app.new_mux)()?;
-    mux.has_session(tmux_session)?;
-    mux.attach_session_in_new_window(tmux_session, window_name)?;
-    writeln!(
-        app.out,
-        "attached \"{}\" in new window \"{}\"",
-        tmux_session, window_name
-    )?;
-    Ok(())
-}
-
-/// Handle `tfmux unbind`: remove one target file from an existing session.
-///
-/// # Errors
-/// Returns an error on invalid names, missing session selection, missing
-/// sessions, missing targets, or filesystem deletion failures.
-pub fn unbind(app: &mut App, args: &UnbindArgs) -> Result<()> {
-    validate_name(&args.name)?;
-
-    let env_session = (app.env)("TFMUX_SESSION");
-    let marker = if has_flag_or_env_session(args.session.as_deref(), env_session.as_deref()) {
-        None
-    } else {
-        store::read_session_marker(&app.cwd)?
-    };
-    let session_name = resolve_send_session_name(
-        args.session.as_deref(),
-        env_session.as_deref(),
-        marker.as_deref(),
-    )?;
-
-    let store = Store::new(app.base_dir.clone());
-    let session_dir = store
-        .find_session_dir(&session_name)?
-        .ok_or_else(|| anyhow!("no tfmux session \"{session_name}\""))?;
-    if !store.delete_target(&session_dir, &args.name)? {
-        bail!("no target \"{}\" in session {}", args.name, session_name);
-    }
-
-    if args.json {
-        let output = UnbindOutput {
-            session: &session_name,
-            name: &args.name,
-            removed: true,
-        };
-        writeln!(app.out, "{}", serde_json::to_string_pretty(&output)?)?;
-    } else {
-        writeln!(
-            app.out,
-            "unbound \"{}\" from session {}",
-            args.name, session_name
-        )?;
-    }
-    Ok(())
-}
-
-/// Handle `tfmux targets`: list bound targets in an existing session and show
-/// whether each stored pane still resolves to the same tmux metadata.
-///
-/// # Errors
-/// Returns an error when no session can be selected, the selected session does
-/// not exist, target files cannot be read, or tmux construction fails.
-pub fn targets(app: &mut App, args: &TargetsArgs) -> Result<()> {
-    let env_session = (app.env)("TFMUX_SESSION");
-    let marker = if has_flag_or_env_session(args.session.as_deref(), env_session.as_deref()) {
-        None
-    } else {
-        store::read_session_marker(&app.cwd)?
-    };
-    let session_name = resolve_send_session_name(
-        args.session.as_deref(),
-        env_session.as_deref(),
-        marker.as_deref(),
-    )?;
-
-    let store = Store::new(app.base_dir.clone());
-    let session_dir = store
-        .find_session_dir(&session_name)?
-        .ok_or_else(|| anyhow!("no tfmux session \"{session_name}\""))?;
-    let stored_targets = store.list_targets(&session_dir)?;
-    if stored_targets.is_empty() {
-        if args.json {
-            writeln!(app.out, "[]")?;
-        }
-        return Ok(());
-    }
-
-    let mux = (app.new_mux)()?;
-    let rows = stored_targets
-        .iter()
-        .map(|target| inspect_target_status(mux.as_ref(), target))
-        .collect::<Vec<_>>();
-    if args.json {
-        let json_rows = rows.iter().map(TargetStatusJson::from).collect::<Vec<_>>();
-        writeln!(app.out, "{}", serde_json::to_string_pretty(&json_rows)?)?;
-    } else {
-        write_targets_table(app, &rows)?;
-    }
-    Ok(())
-}
-
-fn write_targets_table(app: &mut App, rows: &[TargetStatusRow]) -> Result<()> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-    writeln!(
-        app.out,
-        "{:<10} {:<8} {:<8} {:<6} {:<14} STATUS",
-        "NAME", "ROLE", "KIND", "PANE", "LOCATION"
-    )?;
-    for row in rows {
-        let location = format!(
-            "{}:{}.{}",
-            row.target.session, row.target.window, row.target.pane_index
-        );
-        writeln!(
-            app.out,
-            "{:<10} {:<8} {:<8} {:<6} {:<14} {}",
-            row.target.name,
-            row.target.role,
-            row.target.kind,
-            row.target.pane_id,
-            location,
-            row.status.as_str()
-        )?;
-    }
-    Ok(())
-}
-
-fn resolve_send_session_name(
-    flag: Option<&str>,
-    env: Option<&str>,
-    marker: Option<&str>,
-) -> Result<String> {
-    for candidate in [flag, env, marker] {
-        if let Some(name) = candidate.map(str::trim).filter(|s| !s.is_empty()) {
-            validate_name(name)?;
-            return Ok(name.to_string());
-        }
-    }
-    Err(no_send_session_selected())
-}
-
-fn has_flag_or_env_session(flag: Option<&str>, env: Option<&str>) -> bool {
-    [flag, env]
-        .into_iter()
-        .flatten()
-        .any(|candidate| !candidate.trim().is_empty())
-}
-
-fn no_send_session_selected() -> anyhow::Error {
-    anyhow!("no tfmux session selected; pass --session NAME, set TFMUX_SESSION, or add .llm/tfmux-session")
-}
-
-fn missing_send_session(session_name: &str) -> anyhow::Error {
-    anyhow!(
-        "tfmux session \"{session_name}\" not found; run `tfmux bind <name> ... --session {session_name}` first"
-    )
 }
