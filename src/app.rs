@@ -9,7 +9,6 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::git::{Git, GitHub};
 use crate::mux::Mux;
 
 /// Dependency-injection context threaded into every command handler.
@@ -25,10 +24,6 @@ pub struct App<'a> {
     /// Lazily-built tmux backend (constructed only when a command needs it, so
     /// pure-validation failure paths never shell out to tmux).
     pub new_mux: &'a dyn Fn() -> Result<Box<dyn Mux>>,
-    /// Lazily-built Git backend.
-    pub new_git: &'a dyn Fn() -> Result<Box<dyn Git>>,
-    /// Lazily-built GitHub CLI backend.
-    pub new_github: &'a dyn Fn() -> Result<Box<dyn GitHub>>,
     /// Read all text from stdin when a command explicitly asks for `-`.
     pub read_stdin: &'a dyn Fn() -> Result<String>,
     /// Generate a tmux buffer name for one send attempt.

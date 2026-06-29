@@ -4,11 +4,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::app::App;
-use crate::git::PullRequest;
 use crate::mux::{Mux, PaneRef};
 use crate::store::{self, rfc3339, Store};
 use crate::target::{validate_kind, validate_name, validate_role, Target};
@@ -33,8 +31,6 @@ pub enum Command {
     Send(SendArgs),
     /// Attach a detached tmux session in a new window.
     Attach(AttachArgs),
-    /// Safely clean up a finished agent worktree and tmux session.
-    Detach(DetachArgs),
     /// Remove a bound target from a session.
     Unbind(UnbindArgs),
     /// List bound targets in an existing session.
@@ -93,34 +89,6 @@ pub struct AttachArgs {
     /// Name for the new tmux window (defaults to `TMUX_SESSION`).
     #[arg(long, value_name = "NAME")]
     pub window_name: Option<String>,
-}
-
-/// Arguments for `tfmux detach`.
-#[derive(Args)]
-pub struct DetachArgs {
-    /// The tmux session to kill after the worktree is removed.
-    pub tmux_session: String,
-    /// Path to the agent worktree to remove.
-    #[arg(long, value_name = "PATH")]
-    pub worktree: PathBuf,
-    /// Expected worker branch (defaults to the worktree's current branch).
-    #[arg(long, value_name = "BRANCH")]
-    pub branch: Option<String>,
-    /// Main checkout to update (defaults to the current directory).
-    #[arg(long, value_name = "PATH")]
-    pub repo: Option<PathBuf>,
-    /// Local main branch to update and verify.
-    #[arg(long, default_value = "main", value_name = "BRANCH")]
-    pub main: String,
-    /// Remote that owns the selected main branch.
-    #[arg(long, default_value = "origin", value_name = "NAME")]
-    pub remote: String,
-    /// GitHub PR number or URL that proves squash-merge state.
-    #[arg(long, value_name = "NUMBER_OR_URL")]
-    pub pr: String,
-    /// Print the cleanup plan without fetch, pull, removal, or tmux kill.
-    #[arg(long)]
-    pub dry_run: bool,
 }
 
 /// Arguments for `tfmux unbind`.
@@ -597,134 +565,6 @@ pub fn attach(app: &mut App, args: &AttachArgs) -> Result<()> {
     Ok(())
 }
 
-/// Handle `tfmux detach`: verify a finished agent run is merged, remove its
-/// worktree, and kill the worker tmux session.
-///
-/// # Errors
-/// Returns an error when inputs are blank, the tmux session is missing, either
-/// checkout is dirty or on the wrong branch, the PR is not proven merged into
-/// the selected main branch, or any cleanup subprocess fails.
-pub fn detach(app: &mut App, args: &DetachArgs) -> Result<()> {
-    let tmux_session = non_empty_value(&args.tmux_session, "tmux session")?;
-    let main = non_empty_value(&args.main, "--main")?;
-    let remote = non_empty_value(&args.remote, "--remote")?;
-    let pr_arg = non_empty_value(&args.pr, "--pr")?;
-
-    let worktree = canonical_dir(&args.worktree, "--worktree")?;
-    let repo_input = args.repo.as_deref().unwrap_or(&app.cwd);
-    let repo_input = canonical_dir(repo_input, "--repo")?;
-
-    let mux = (app.new_mux)()?;
-    mux.has_session(tmux_session)
-        .with_context(|| format!("tmux session \"{tmux_session}\" is not available"))?;
-
-    let git = (app.new_git)()?;
-    let repo_root = canonical_git_root(git.root(&repo_input)?, "--repo")?;
-    let worktree_root = canonical_git_root(git.root(&worktree)?, "--worktree")?;
-    if worktree_root != worktree {
-        bail!(
-            "--worktree must point at the worktree root; got {}, root is {}",
-            worktree.display(),
-            worktree_root.display()
-        );
-    }
-    if worktree_root == repo_root {
-        bail!(
-            "--repo and --worktree both resolve to {}; run from the main checkout or pass --repo PATH to it",
-            worktree_root.display()
-        );
-    }
-
-    let worktree_status = git
-        .status_porcelain(&worktree_root)
-        .with_context(|| format!("checking worktree status in {}", worktree_root.display()))?;
-    ensure_clean_status("worktree", &worktree_root, &worktree_status)?;
-
-    let actual_branch = git
-        .current_branch(&worktree_root)
-        .with_context(|| format!("checking worktree branch in {}", worktree_root.display()))?;
-    let actual_branch = non_empty_value(&actual_branch, "worktree branch")?;
-    let branch = match args.branch.as_deref() {
-        Some(flag) => {
-            let branch = non_empty_value(flag, "--branch")?;
-            if branch != actual_branch {
-                bail!(
-                    "worktree is on branch {actual_branch}, not {branch}; pass --branch {actual_branch} or inspect {}",
-                    worktree_root.display()
-                );
-            }
-            branch.to_string()
-        }
-        None => actual_branch.to_string(),
-    };
-
-    let repo_branch = git
-        .current_branch(&repo_root)
-        .with_context(|| format!("checking repo branch in {}", repo_root.display()))?;
-    let repo_branch = non_empty_value(&repo_branch, "repo branch")?;
-    if repo_branch != main {
-        bail!(
-            "repo {} is on branch {repo_branch}, not {main}; check out {main} or pass --repo PATH to a clean main checkout",
-            repo_root.display()
-        );
-    }
-    let repo_status = git
-        .status_porcelain(&repo_root)
-        .with_context(|| format!("checking repo status in {}", repo_root.display()))?;
-    ensure_clean_status("repo main checkout", &repo_root, &repo_status)?;
-
-    let github = (app.new_github)()?;
-    let pr = github
-        .pull_request(&repo_root, pr_arg)
-        .with_context(|| format!("loading GitHub PR {pr_arg}; pass --pr NUMBER_OR_URL"))?;
-    let merge_commit = verify_pr_merged(pr_arg, &pr, main, &branch)?;
-
-    if args.dry_run {
-        writeln!(app.out, "dry run: would detach \"{tmux_session}\"")?;
-        writeln!(app.out, "would verify PR {pr_arg} is merged into {main}")?;
-        writeln!(
-            app.out,
-            "would fetch {remote} {main} in {}",
-            repo_root.display()
-        )?;
-        writeln!(
-            app.out,
-            "would pull --ff-only {remote} {main} in {}",
-            repo_root.display()
-        )?;
-        writeln!(app.out, "would remove worktree {}", worktree_root.display())?;
-        writeln!(app.out, "would kill tmux session {tmux_session}")?;
-        return Ok(());
-    }
-
-    git.fetch(&repo_root, remote, main)
-        .with_context(|| format!("fetching {remote} {main} in {}", repo_root.display()))?;
-    git.pull_ff_only(&repo_root, remote, main)
-        .with_context(|| {
-            format!(
-            "fast-forward pulling {remote} {main} in {}; resolve local main state before detach",
-            repo_root.display()
-        )
-        })?;
-    git.merge_base_is_ancestor(&repo_root, &merge_commit, main)
-        .with_context(|| {
-            format!(
-                "PR merge commit {merge_commit} is not on {main} after update; inspect {pr_arg}"
-            )
-        })?;
-    git.remove_worktree(&repo_root, &worktree_root)
-        .with_context(|| format!("removing worktree {}", worktree_root.display()))?;
-    mux.kill_session(tmux_session)
-        .with_context(|| format!("killing tmux session {tmux_session}"))?;
-
-    writeln!(app.out, "detached \"{tmux_session}\"")?;
-    writeln!(app.out, "worktree removed: {}", worktree_root.display())?;
-    writeln!(app.out, "main updated: {remote}/{main}")?;
-    writeln!(app.out, "pr verified: {}", pr.url)?;
-    writeln!(app.out, "branch kept: {branch}")?;
-    Ok(())
-}
-
 /// Handle `tfmux unbind`: remove one target file from an existing session.
 ///
 /// # Errors
@@ -874,82 +714,6 @@ fn missing_send_session(session_name: &str) -> anyhow::Error {
     )
 }
 
-fn non_empty_value<'a>(value: &'a str, name: &str) -> Result<&'a str> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        bail!("{name} requires a non-empty value");
-    }
-    Ok(trimmed)
-}
-
-fn canonical_dir(path: &Path, name: &str) -> Result<PathBuf> {
-    if path.as_os_str().is_empty() {
-        bail!("{name} requires a non-empty path");
-    }
-    if !path.exists() {
-        bail!("{} {} does not exist", name, path.display());
-    }
-    if !path.is_dir() {
-        bail!("{} {} is not a directory", name, path.display());
-    }
-    fs::canonicalize(path).with_context(|| format!("canonicalizing {} {}", name, path.display()))
-}
-
-fn canonical_git_root(path: PathBuf, name: &str) -> Result<PathBuf> {
-    fs::canonicalize(&path)
-        .with_context(|| format!("{name} {} is not a readable git checkout", path.display()))
-}
-
-fn ensure_clean_status(kind: &str, path: &Path, status: &str) -> Result<()> {
-    let status = status.trim();
-    if status.is_empty() {
-        return Ok(());
-    }
-    bail!(
-        "{kind} {} has uncommitted or untracked changes; commit, stash, or remove them before detach:\n{status}",
-        path.display()
-    )
-}
-
-fn verify_pr_merged(pr_arg: &str, pr: &PullRequest, main: &str, branch: &str) -> Result<String> {
-    if pr.state != "MERGED" {
-        bail!(
-            "PR {pr_arg} is {}, not MERGED; wait for merge or pass the merged PR",
-            pr.state
-        );
-    }
-    if pr
-        .merged_at
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none()
-    {
-        bail!("PR {pr_arg} has no mergedAt timestamp; inspect it before detach");
-    }
-    if pr.base_ref_name != main {
-        bail!(
-            "PR {pr_arg} targets {}, not {main}; pass --main {} or inspect the PR",
-            pr.base_ref_name,
-            pr.base_ref_name
-        );
-    }
-    if pr.head_ref_name != branch {
-        bail!(
-            "PR {pr_arg} head branch is {}, not {branch}; pass --branch {} or inspect the PR",
-            pr.head_ref_name,
-            pr.head_ref_name
-        );
-    }
-    let merge_commit = pr
-        .merge_commit
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("PR {pr_arg} has no merge commit; inspect it before detach"))?;
-    Ok(merge_commit.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1097,10 +861,6 @@ mod tests {
         fn attach_session_in_new_window(&self, _session: &str, _window_name: &str) -> Result<()> {
             anyhow::bail!("unexpected attach_session_in_new_window call")
         }
-
-        fn kill_session(&self, _session: &str) -> Result<()> {
-            anyhow::bail!("unexpected kill_session call")
-        }
     }
 
     #[test]
@@ -1201,11 +961,9 @@ mod tests {
 
         match cli.command {
             Command::Send(args) => assert_eq!(args.file.as_deref(), Some("")),
-            Command::Bind(_)
-            | Command::Attach(_)
-            | Command::Detach(_)
-            | Command::Unbind(_)
-            | Command::Targets(_) => panic!("expected send command"),
+            Command::Bind(_) | Command::Attach(_) | Command::Unbind(_) | Command::Targets(_) => {
+                panic!("expected send command")
+            }
         }
     }
 

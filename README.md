@@ -15,7 +15,6 @@ Inspired by `riff3`; it shares no state, paths, or commands with it.
   `tfmux send mediator --text "done"`.
 - Lists bound targets and marks each pane `live`, `stale`, or `dead`.
 - Opens detached tmux sessions in a new window of the current tmux client.
-- Safely cleans up finished agent worktrees after PR-backed merge proof.
 - Stores only lightweight session and target JSON under `~/.tfmux` or
   `$TFMUX_HOME`.
 
@@ -175,62 +174,6 @@ env -u TMUX tmux attach-session -t <TMUX_SESSION>
 
 `attach` is independent of tfmux factory state. It does not read
 `TFMUX_SESSION`, `.llm/tfmux-session`, or `~/.tfmux`.
-
-### Detach a Finished Agent Run
-
-```bash
-tfmux detach <TMUX_SESSION> --worktree <PATH> --pr <NUMBER_OR_URL> \
-  [--branch <BRANCH>] [--repo <PATH>] [--main main] [--remote origin] [--dry-run]
-```
-
-Example:
-
-```bash
-tfmux detach sf_add_dark_mode_codex \
-  --worktree /repo.worktrees/add-dark-mode \
-  --branch feat/add-dark-mode \
-  --repo /repo \
-  --pr https://github.com/acme/repo/pull/123
-```
-
-Use `detach` after an agent has finished and the corresponding PR has been
-merged. It is intentionally explicit in the first version: pass the agent tmux
-session, the agent worktree path, and the GitHub PR number or URL.
-
-`--pr` is required because tmux-factory uses squash merges. A squash-merged
-feature branch is usually not an ancestor of `main`, so a local
-`git branch --merged main` check would be unsafe. `detach` instead checks the
-GitHub PR state, requires a merge commit, updates local main safely, and verifies
-that merge commit is on the selected main branch.
-
-Safety checks happen before deletion:
-
-- The tmux session must exist.
-- The worktree must be a clean git worktree root on the expected branch.
-- The repo checkout must be clean and on `--main`.
-- The PR must be `MERGED`, target `--main`, and match the worktree branch.
-- Local main is updated with `git fetch` plus `git pull --ff-only`.
-- The worktree is removed only after the PR merge commit is proven on main.
-- The tmux session is killed only after worktree removal succeeds.
-
-`--dry-run` validates non-destructive preconditions and prints the planned fetch,
-pull, worktree removal, and tmux kill without performing those actions.
-
-`detach` does not delete the feature branch and does not remove tfmux target or
-session JSON. Those can be separate, explicit cleanup steps later.
-
-The tmux-factory launcher skills know the worker session, worktree, branch, and
-repo, so they print a copy-ready command such as:
-
-```bash
-tfmux detach sf_add_dark_mode_codex \
-  --worktree /repo.worktrees/add-dark-mode \
-  --branch feat/add-dark-mode \
-  --repo /repo \
-  --pr <PR_URL_OR_NUMBER>
-```
-
-Replace the PR placeholder after verifying the agent's done ping.
 
 ### Unbind a Target
 
