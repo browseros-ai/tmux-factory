@@ -551,7 +551,7 @@ fn attach_derived_default_socket_stays_legacy_empty_socket() {
 }
 
 #[test]
-fn attach_derived_custom_main_socket_stays_named_socket() {
+fn attach_derived_custom_main_socket_stays_legacy_empty_socket() {
     let s = Scenario::new()
         .env("TMUX", "/tmp/tmux-501/main,1234,0")
         .env("TFMUX_MAIN_SOCKET", "main");
@@ -560,14 +560,10 @@ fn attach_derived_custom_main_socket_stays_named_socket() {
 
     assert!(result.is_ok(), "{:?}", result.err());
     assert_eq!(stdout, "attached \"worker\" in new window \"worker\"\n");
-    assert_eq!(s.built_sockets(), vec!["main".to_string()]);
+    assert_eq!(s.built_sockets(), vec!["".to_string()]);
     assert_eq!(
         s.attached_windows(),
-        vec![(
-            "worker".to_string(),
-            "worker".to_string(),
-            "main".to_string()
-        )]
+        vec![("worker".to_string(), "worker".to_string(), "".to_string())]
     );
 }
 
@@ -685,7 +681,7 @@ fn bind_real_binary_uses_socket_flag_for_pane_resolution() {
 
 #[cfg(unix)]
 #[test]
-fn attach_real_binary_uses_custom_main_socket_for_probe_and_inner_attach() {
+fn attach_real_binary_uses_custom_main_socket_for_probe_and_legacy_inner_attach() {
     let dir = tempfile::tempdir().unwrap();
     let fake_tmux = write_multi_call_recording_tmux(dir.path());
 
@@ -720,7 +716,7 @@ fn attach_real_binary_uses_custom_main_socket_for_probe_and_inner_attach() {
             "new-window\n",
             "-n\n",
             "worker\n",
-            "env -u TMUX tmux -L main attach-session -t worker\n",
+            "env -u TMUX tmux attach-session -t worker\n",
             "--\n",
         )
     );
