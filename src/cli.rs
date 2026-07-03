@@ -592,9 +592,6 @@ pub fn unbind(app: &mut App, args: &UnbindArgs) -> Result<()> {
     let session_dir = store
         .find_session_dir(&session_name)?
         .ok_or_else(|| anyhow!("no tfmux session \"{session_name}\""))?;
-    if store.load_target(&session_dir, &args.name)?.is_none() {
-        bail!("no target \"{}\" in session {}", args.name, session_name);
-    }
     if !store.delete_target(&session_dir, &args.name)? {
         bail!("no target \"{}\" in session {}", args.name, session_name);
     }

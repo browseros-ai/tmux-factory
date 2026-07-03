@@ -1199,6 +1199,23 @@ fn unbind_missing_target_errors_cleanly() {
 }
 
 #[test]
+fn unbind_removes_malformed_target_without_parsing() {
+    let s = Scenario::new();
+    let store = Store::new(s.home().to_path_buf());
+    let session_dir = store.create_session("demo", fixed_now()).unwrap();
+    std::fs::create_dir_all(session_dir.join("targets")).unwrap();
+    let target_path = session_dir.join("targets/agent1.json");
+    std::fs::write(&target_path, "{not json").unwrap();
+
+    let (result, stdout) = s.run(&["tfmux", "unbind", "agent1", "--session", "demo"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "unbound \"agent1\" from session demo\n");
+    assert!(!target_path.exists());
+    assert_eq!(s.built(), 0);
+}
+
+#[test]
 fn unbind_invalid_name_errors_before_any_write() {
     let s = Scenario::new();
 

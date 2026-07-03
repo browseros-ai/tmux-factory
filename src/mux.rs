@@ -88,8 +88,19 @@ impl Tmux {
         full_args.push("-L");
         full_args.push(self.socket.as_str());
         full_args.extend_from_slice(args);
+        let sub = args.first().copied().unwrap_or("tmux");
+        self.run_raw(&full_args, stdin, sub)
+    }
+
+    /// Run tmux without socket routing for command surfaces not in this slice.
+    fn run_ambient(&self, args: &[&str]) -> Result<String> {
+        let sub = args.first().copied().unwrap_or("tmux");
+        self.run_raw(args, None, sub)
+    }
+
+    fn run_raw(&self, args: &[&str], stdin: Option<&str>, sub: &str) -> Result<String> {
         let mut child = Command::new(&self.bin)
-            .args(&full_args)
+            .args(args)
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {
@@ -116,7 +127,6 @@ impl Tmux {
         let mut detail = String::from_utf8_lossy(&output.stdout).into_owned();
         detail.push_str(&String::from_utf8_lossy(&output.stderr));
         let detail = detail.trim();
-        let sub = args.first().copied().unwrap_or("tmux");
         if detail.is_empty() {
             bail!("tmux {sub} failed");
         }
@@ -184,7 +194,9 @@ impl Mux for Tmux {
     }
 
     fn has_session(&self, session: &str) -> Result<()> {
-        self.run(&["has-session", "-t", session])?;
+        // Attach socket selection is a later feature; keep this ambient so the
+        // current tmux client/server behavior stays byte-compatible.
+        self.run_ambient(&["has-session", "-t", session])?;
         Ok(())
     }
 
@@ -193,7 +205,7 @@ impl Mux for Tmux {
             "env -u TMUX tmux attach-session -t {}",
             shell_quote(session)
         );
-        self.run(&["new-window", "-n", window_name, &command])?;
+        self.run_ambient(&["new-window", "-n", window_name, &command])?;
         Ok(())
     }
 }
@@ -420,7 +432,7 @@ mod tests {
         tmux.has_session("worker").unwrap();
 
         let args = recorded_args(dir.path());
-        assert_eq!(args, vec!["-L", "default", "has-session", "-t", "worker"]);
+        assert_eq!(args, vec!["has-session", "-t", "worker"]);
     }
 
     #[cfg(unix)]
@@ -450,8 +462,6 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "-L",
-                "default",
                 "new-window",
                 "-n",
                 "agent-worker",
@@ -474,8 +484,6 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "-L",
-                "default",
                 "new-window",
                 "-n",
                 "agent",
@@ -507,10 +515,13 @@ mod tests {
         let bin = write_recording_tmux(dir.path(), "");
         let tmux = Tmux::new(bin, "factory", "default");
 
-        tmux.has_session("worker").unwrap();
+        tmux.send_enter("%5").unwrap();
 
         let args = recorded_args(dir.path());
-        assert_eq!(args, vec!["-L", "factory", "has-session", "-t", "worker"]);
+        assert_eq!(
+            args,
+            vec!["-L", "factory", "send-keys", "-t", "%5", "Enter"]
+        );
     }
 
     #[cfg(unix)]
