@@ -454,6 +454,7 @@ pub fn bind(app: &mut App, args: &BindArgs) -> Result<()> {
         session: pane.session,
         window: pane.window,
         pane_index: pane.pane_index,
+        socket: String::new(),
         bound_at: rfc3339(now),
     };
 
@@ -750,6 +751,7 @@ mod tests {
             session: "sess".to_string(),
             window: "1".to_string(),
             pane_index: "0".to_string(),
+            socket: String::new(),
             bound_at: "2026-06-28T12:00:00Z".to_string(),
         }
     }

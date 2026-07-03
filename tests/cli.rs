@@ -283,6 +283,7 @@ impl Scenario {
                 session: "sess".to_string(),
                 window: "1".to_string(),
                 pane_index: "0".to_string(),
+                socket: String::new(),
                 bound_at: "2026-06-28T12:00:00Z".to_string(),
             },
         );
@@ -366,6 +367,7 @@ fn stored_target(
         session: session.to_string(),
         window: window.to_string(),
         pane_index: pane_index.to_string(),
+        socket: String::new(),
         bound_at: "2026-06-28T12:00:00Z".to_string(),
     }
 }
@@ -552,6 +554,7 @@ fn bind_here_uses_tmux_pane_and_stores_canonical_pane() {
     assert_eq!(t.session, "work");
     assert_eq!(t.window, "2");
     assert_eq!(t.pane_index, "1");
+    assert_eq!(t.socket, "");
     assert_eq!(t.bound_at, "2026-06-28T12:00:00Z");
 }
 
