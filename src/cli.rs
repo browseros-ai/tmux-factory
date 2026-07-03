@@ -93,6 +93,9 @@ pub struct AttachArgs {
     /// Name for the new tmux window (defaults to `TMUX_SESSION`).
     #[arg(long, value_name = "NAME")]
     pub window_name: Option<String>,
+    /// tmux socket name for the target session probe and nested attach.
+    #[arg(long, value_name = "NAME")]
+    pub socket: Option<String>,
 }
 
 /// Arguments for `tfmux unbind`.
@@ -447,7 +450,7 @@ pub fn bind(app: &mut App, args: &BindArgs) -> Result<()> {
     };
     let env_socket = (app.env)("TFMUX_SOCKET");
     let main_socket = (app.env)("TFMUX_MAIN_SOCKET");
-    let bind_socket = resolve_bind_socket(
+    let bind_socket = resolve_socket_selection(
         args.socket.as_deref(),
         env_socket.as_deref(),
         tmux_env.as_deref(),
@@ -574,9 +577,18 @@ pub fn attach(app: &mut App, args: &AttachArgs) -> Result<()> {
         bail!("attach requires TMUX; run from inside tmux");
     }
 
-    let mux = (app.new_mux)("")?;
+    let env_socket = (app.env)("TFMUX_SOCKET");
+    let main_socket = (app.env)("TFMUX_MAIN_SOCKET");
+    let attach_socket = resolve_attach_socket(
+        args.socket.as_deref(),
+        env_socket.as_deref(),
+        in_tmux.as_deref(),
+        main_socket.as_deref(),
+    )?;
+
+    let mux = (app.new_mux)(&attach_socket)?;
     mux.has_session(tmux_session)?;
-    mux.attach_session_in_new_window(tmux_session, window_name)?;
+    mux.attach_session_in_new_window(tmux_session, window_name, &attach_socket)?;
     writeln!(
         app.out,
         "attached \"{}\" in new window \"{}\"",
@@ -724,7 +736,7 @@ fn has_flag_or_env_session(flag: Option<&str>, env: Option<&str>) -> bool {
         .any(|candidate| !candidate.trim().is_empty())
 }
 
-fn resolve_bind_socket(
+fn resolve_socket_selection(
     flag: Option<&str>,
     env: Option<&str>,
     tmux: Option<&str>,
@@ -734,13 +746,31 @@ fn resolve_bind_socket(
     let main_socket = resolve_main_socket_name(main_socket);
     for candidate in [flag, env] {
         if let Some(socket) = candidate.map(str::trim).filter(|s| !s.is_empty()) {
-            return normalize_selected_bind_socket(socket);
+            return normalize_selected_socket(socket);
         }
     }
     if derive_from_tmux {
         if let Some(socket) = tmux_socket_basename(tmux)? {
-            return normalize_derived_bind_socket(&socket, &main_socket);
+            return normalize_derived_socket(&socket, &main_socket);
         }
+    }
+    Ok(String::new())
+}
+
+fn resolve_attach_socket(
+    flag: Option<&str>,
+    env: Option<&str>,
+    tmux: Option<&str>,
+    main_socket: Option<&str>,
+) -> Result<String> {
+    let main_socket = resolve_main_socket_name(main_socket);
+    for candidate in [flag, env] {
+        if let Some(socket) = candidate.map(str::trim).filter(|s| !s.is_empty()) {
+            return normalize_selected_socket(socket);
+        }
+    }
+    if let Some(socket) = tmux_socket_basename(tmux)? {
+        return normalize_derived_socket(&socket, &main_socket);
     }
     Ok(String::new())
 }
@@ -772,12 +802,12 @@ fn tmux_socket_basename(tmux: Option<&str>) -> Result<Option<String>> {
     Ok(Some(name.to_string()))
 }
 
-fn normalize_selected_bind_socket(socket: &str) -> Result<String> {
+fn normalize_selected_socket(socket: &str) -> Result<String> {
     validate_name(socket)?;
     Ok(socket.to_string())
 }
 
-fn normalize_derived_bind_socket(socket: &str, main_socket: &str) -> Result<String> {
+fn normalize_derived_socket(socket: &str, main_socket: &str) -> Result<String> {
     validate_name(socket)?;
     if socket == "default" || socket == main_socket {
         Ok(String::new())
@@ -941,7 +971,12 @@ mod tests {
             anyhow::bail!("unexpected has_session call")
         }
 
-        fn attach_session_in_new_window(&self, _session: &str, _window_name: &str) -> Result<()> {
+        fn attach_session_in_new_window(
+            &self,
+            _session: &str,
+            _window_name: &str,
+            _socket: &str,
+        ) -> Result<()> {
             anyhow::bail!("unexpected attach_session_in_new_window call")
         }
     }
