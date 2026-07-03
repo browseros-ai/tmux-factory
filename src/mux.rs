@@ -44,7 +44,12 @@ pub trait Mux {
     fn has_session(&self, session: &str) -> Result<()>;
 
     /// Open a new tmux window that attaches to `session` with `TMUX` unset.
-    fn attach_session_in_new_window(&self, session: &str, window_name: &str) -> Result<()>;
+    fn attach_session_in_new_window(
+        &self,
+        session: &str,
+        window_name: &str,
+        socket: &str,
+    ) -> Result<()>;
 }
 
 /// Real tmux backend that shells out to the `tmux` binary.
@@ -194,17 +199,26 @@ impl Mux for Tmux {
     }
 
     fn has_session(&self, session: &str) -> Result<()> {
-        // Attach socket selection is a later feature; keep this ambient so the
-        // current tmux client/server behavior stays byte-compatible.
-        self.run_ambient(&["has-session", "-t", session])?;
+        self.run(&["has-session", "-t", session])?;
         Ok(())
     }
 
-    fn attach_session_in_new_window(&self, session: &str, window_name: &str) -> Result<()> {
-        let command = format!(
-            "env -u TMUX tmux attach-session -t {}",
-            shell_quote(session)
-        );
+    fn attach_session_in_new_window(
+        &self,
+        session: &str,
+        window_name: &str,
+        socket: &str,
+    ) -> Result<()> {
+        let session = shell_quote(session);
+        let socket = socket.trim();
+        let command = if socket.is_empty() {
+            format!("env -u TMUX tmux attach-session -t {session}")
+        } else {
+            format!(
+                "env -u TMUX tmux -L {} attach-session -t {session}",
+                shell_quote(socket)
+            )
+        };
         self.run_ambient(&["new-window", "-n", window_name, &command])?;
         Ok(())
     }
@@ -432,7 +446,7 @@ mod tests {
         tmux.has_session("worker").unwrap();
 
         let args = recorded_args(dir.path());
-        assert_eq!(args, vec!["has-session", "-t", "worker"]);
+        assert_eq!(args, vec!["-L", "default", "has-session", "-t", "worker"]);
     }
 
     #[cfg(unix)]
@@ -450,12 +464,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn attach_session_in_new_window_issues_exact_argv() {
+    fn attach_session_in_new_window_empty_socket_keeps_legacy_inner_command() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_recording_tmux(dir.path(), "");
         let tmux = Tmux::new(bin, "", "default");
 
-        tmux.attach_session_in_new_window("worker", "agent-worker")
+        tmux.attach_session_in_new_window("worker", "agent-worker", "")
             .unwrap();
 
         let args = recorded_args(dir.path());
@@ -472,12 +486,34 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn attach_session_in_new_window_socket_qualifies_inner_command_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_tmux(dir.path(), "");
+        let tmux = Tmux::new(bin, "factory", "default");
+
+        tmux.attach_session_in_new_window("worker", "agent-worker", "factory")
+            .unwrap();
+
+        let args = recorded_args(dir.path());
+        assert_eq!(
+            args,
+            vec![
+                "new-window",
+                "-n",
+                "agent-worker",
+                "env -u TMUX tmux -L factory attach-session -t worker",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn attach_session_quotes_nested_session_argument() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_recording_tmux(dir.path(), "");
         let tmux = Tmux::new(bin, "", "default");
 
-        tmux.attach_session_in_new_window("work session's $main", "agent")
+        tmux.attach_session_in_new_window("work session's $main", "agent", "")
             .unwrap();
 
         let args = recorded_args(dir.path());

@@ -32,7 +32,7 @@ struct MuxCalls {
     enters: Vec<String>,
     captured: Vec<(String, i32)>,
     has_sessions: Vec<String>,
-    attached_windows: Vec<(String, String)>,
+    attached_windows: Vec<(String, String, String)>,
 }
 
 /// Fake tmux: records each resolve call and returns a scripted pane (or error).
@@ -111,11 +111,17 @@ impl Mux for FakeMux {
         Ok(())
     }
 
-    fn attach_session_in_new_window(&self, session: &str, window_name: &str) -> anyhow::Result<()> {
-        self.calls
-            .borrow_mut()
-            .attached_windows
-            .push((session.to_string(), window_name.to_string()));
+    fn attach_session_in_new_window(
+        &self,
+        session: &str,
+        window_name: &str,
+        socket: &str,
+    ) -> anyhow::Result<()> {
+        self.calls.borrow_mut().attached_windows.push((
+            session.to_string(),
+            window_name.to_string(),
+            socket.to_string(),
+        ));
         Ok(())
     }
 }
@@ -242,7 +248,7 @@ impl Scenario {
         self.calls.borrow().has_sessions.clone()
     }
 
-    fn attached_windows(&self) -> Vec<(String, String)> {
+    fn attached_windows(&self) -> Vec<(String, String, String)> {
         self.calls.borrow().attached_windows.clone()
     }
 
@@ -406,7 +412,7 @@ fn attach_inside_tmux_defaults_window_name_to_session_without_state() {
     assert_eq!(s.has_sessions(), vec!["worker".to_string()]);
     assert_eq!(
         s.attached_windows(),
-        vec![("worker".to_string(), "worker".to_string())]
+        vec![("worker".to_string(), "worker".to_string(), "".to_string())]
     );
     assert!(s.resolved().is_empty());
     assert!(s.loaded().is_empty());
@@ -428,7 +434,11 @@ fn attach_custom_window_name() {
     assert_eq!(s.has_sessions(), vec!["worker".to_string()]);
     assert_eq!(
         s.attached_windows(),
-        vec![("worker".to_string(), "agent-worker".to_string())]
+        vec![(
+            "worker".to_string(),
+            "agent-worker".to_string(),
+            "".to_string()
+        )]
     );
     assert_eq!(s.home_entry_count(), 0);
 }
@@ -453,9 +463,108 @@ fn attach_preserves_raw_session_and_window_names_after_blank_validation() {
     assert_eq!(s.has_sessions(), vec![" worker ".to_string()]);
     assert_eq!(
         s.attached_windows(),
-        vec![(" worker ".to_string(), " agent worker ".to_string())]
+        vec![(
+            " worker ".to_string(),
+            " agent worker ".to_string(),
+            "".to_string()
+        )]
     );
     assert_eq!(s.home_entry_count(), 0);
+}
+
+#[test]
+fn attach_socket_flag_wins_over_env_and_tmux_derivation() {
+    let s = Scenario::new()
+        .env("TMUX", "/tmp/tmux-501/derived,1234,0")
+        .env("TFMUX_SOCKET", "envsock");
+
+    let (result, stdout) = s.run(&["tfmux", "attach", "worker", "--socket", "factory"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "attached \"worker\" in new window \"worker\"\n");
+    assert_eq!(s.built_sockets(), vec!["factory".to_string()]);
+    assert_eq!(s.has_sessions(), vec!["worker".to_string()]);
+    assert_eq!(
+        s.attached_windows(),
+        vec![(
+            "worker".to_string(),
+            "worker".to_string(),
+            "factory".to_string()
+        )]
+    );
+    assert_eq!(s.home_entry_count(), 0);
+}
+
+#[test]
+fn attach_socket_env_wins_over_tmux_derivation() {
+    let s = Scenario::new()
+        .env("TMUX", "/tmp/tmux-501/derived,1234,0")
+        .env("TFMUX_SOCKET", "factory");
+
+    let (result, stdout) = s.run(&["tfmux", "attach", "worker"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "attached \"worker\" in new window \"worker\"\n");
+    assert_eq!(s.built_sockets(), vec!["factory".to_string()]);
+    assert_eq!(
+        s.attached_windows(),
+        vec![(
+            "worker".to_string(),
+            "worker".to_string(),
+            "factory".to_string()
+        )]
+    );
+}
+
+#[test]
+fn attach_derives_socket_from_tmux_socket_path() {
+    let s = Scenario::new().env("TMUX", "/tmp/tmux-501/factory,1234,0");
+
+    let (result, stdout) = s.run(&["tfmux", "attach", "worker"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "attached \"worker\" in new window \"worker\"\n");
+    assert_eq!(s.built_sockets(), vec!["factory".to_string()]);
+    assert_eq!(
+        s.attached_windows(),
+        vec![(
+            "worker".to_string(),
+            "worker".to_string(),
+            "factory".to_string()
+        )]
+    );
+}
+
+#[test]
+fn attach_derived_default_socket_stays_legacy_empty_socket() {
+    let s = Scenario::new().env("TMUX", "/tmp/tmux-501/default,1234,0");
+
+    let (result, stdout) = s.run(&["tfmux", "attach", "worker"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "attached \"worker\" in new window \"worker\"\n");
+    assert_eq!(s.built_sockets(), vec!["".to_string()]);
+    assert_eq!(
+        s.attached_windows(),
+        vec![("worker".to_string(), "worker".to_string(), "".to_string())]
+    );
+}
+
+#[test]
+fn attach_derived_main_socket_stays_legacy_empty_socket() {
+    let s = Scenario::new()
+        .env("TMUX", "/tmp/tmux-501/main,1234,0")
+        .env("TFMUX_MAIN_SOCKET", "main");
+
+    let (result, stdout) = s.run(&["tfmux", "attach", "worker"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "attached \"worker\" in new window \"worker\"\n");
+    assert_eq!(s.built_sockets(), vec!["".to_string()]);
+    assert_eq!(
+        s.attached_windows(),
+        vec![("worker".to_string(), "worker".to_string(), "".to_string())]
+    );
 }
 
 #[test]
