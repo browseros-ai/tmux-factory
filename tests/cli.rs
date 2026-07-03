@@ -24,7 +24,7 @@ fn fixed_now() -> DateTime<Utc> {
 
 #[derive(Default)]
 struct MuxCalls {
-    built: u32,
+    built: Vec<String>,
     resolved: Vec<String>,
     loaded: Vec<(String, String)>,
     pasted: Vec<(String, String)>,
@@ -211,7 +211,11 @@ impl Scenario {
     }
 
     fn built(&self) -> u32 {
-        self.calls.borrow().built
+        self.calls.borrow().built.len() as u32
+    }
+
+    fn built_sockets(&self) -> Vec<String> {
+        self.calls.borrow().built.clone()
     }
 
     fn resolved(&self) -> Vec<String> {
@@ -311,8 +315,8 @@ impl Scenario {
         let has_session_err = self.has_session_err.clone();
         let resolve_overrides = self.resolve_overrides.clone();
         let captures = self.captures.clone();
-        let new_mux = move || -> anyhow::Result<Box<dyn Mux>> {
-            calls.borrow_mut().built += 1;
+        let new_mux = move |socket: &str| -> anyhow::Result<Box<dyn Mux>> {
+            calls.borrow_mut().built.push(socket.to_string());
             Ok(Box::new(FakeMux {
                 calls: calls.clone(),
                 pane: pane.clone(),
@@ -370,6 +374,11 @@ fn stored_target(
         socket: String::new(),
         bound_at: "2026-06-28T12:00:00Z".to_string(),
     }
+}
+
+fn on_socket(mut target: Target, socket: &str) -> Target {
+    target.socket = socket.to_string();
+    target
 }
 
 fn pane_ref_at(pane_id: &str, session: &str, window: &str, pane_index: &str) -> PaneRef {
@@ -477,6 +486,42 @@ fn attach_real_binary_outside_tmux_does_not_require_home() {
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         "error: attach requires TMUX; run from inside tmux\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bind_real_binary_uses_tfmux_main_socket_for_empty_record_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_tmux = write_socket_recording_tmux(dir.path());
+    let home = tempfile::tempdir().unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tfmux"))
+        .args(["bind", "agent1", "--tmux", "sess:1.0", "--session", "demo"])
+        .env("TFMUX_HOME", home.path())
+        .env("TFMUX_TMUX_BIN", &fake_tmux)
+        .env("TFMUX_MAIN_SOCKET", "main")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let argv = std::fs::read_to_string(dir.path().join("argv.txt")).unwrap();
+    let args = argv.lines().collect::<Vec<_>>();
+    assert_eq!(
+        args,
+        vec![
+            "-L",
+            "main",
+            "display-message",
+            "-p",
+            "-t",
+            "sess:1.0",
+            "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}",
+        ]
     );
 }
 
@@ -818,6 +863,52 @@ fn send_text_succeeds_against_bound_target() {
 }
 
 #[test]
+fn send_uses_empty_socket_from_stored_target() {
+    let s = Scenario::new();
+    s.save_target("demo", "agent1");
+
+    let (send_result, stdout) = s.run(&[
+        "tfmux",
+        "send",
+        "agent1",
+        "--text",
+        "hello",
+        "--session",
+        "demo",
+    ]);
+
+    assert!(send_result.is_ok(), "{:?}", send_result.err());
+    assert_eq!(stdout, "sent 5 bytes to \"agent1\" (%5)\n");
+    assert_eq!(s.built_sockets(), vec!["".to_string()]);
+}
+
+#[test]
+fn send_uses_named_socket_from_stored_target() {
+    let s = Scenario::new();
+    s.save_target_record(
+        "demo",
+        on_socket(
+            stored_target("agent1", "agent", "claude", "%5", "sess", "1", "0"),
+            "factory",
+        ),
+    );
+
+    let (send_result, stdout) = s.run(&[
+        "tfmux",
+        "send",
+        "agent1",
+        "--text",
+        "hello",
+        "--session",
+        "demo",
+    ]);
+
+    assert!(send_result.is_ok(), "{:?}", send_result.err());
+    assert_eq!(stdout, "sent 5 bytes to \"agent1\" (%5)\n");
+    assert_eq!(s.built_sockets(), vec!["factory".to_string()]);
+}
+
+#[test]
 fn send_file_succeeds_against_bound_target() {
     let s = Scenario::new();
     let file = s.cwd.path().join("message.txt");
@@ -1149,6 +1240,36 @@ fn targets_session_prints_table_for_bound_targets() {
 }
 
 #[test]
+fn targets_uses_socket_from_each_stored_target() {
+    let s = Scenario::new()
+        .resolve_override("%5", Ok(pane_ref_at("%5", "work", "1", "0")))
+        .resolve_override("%3", Err("can't find pane %3".to_string()));
+    s.save_target_record(
+        "demo",
+        on_socket(
+            stored_target("mediator", "mediator", "codex", "%3", "work", "0", "0"),
+            "",
+        ),
+    );
+    s.save_target_record(
+        "demo",
+        on_socket(
+            stored_target("agent1", "agent", "claude", "%5", "work", "1", "0"),
+            "factory",
+        ),
+    );
+
+    let (result, _) = s.run(&["tfmux", "targets", "--session", "demo"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(
+        s.built_sockets(),
+        vec!["factory".to_string(), "".to_string()]
+    );
+    assert_eq!(s.resolved(), vec!["%5".to_string(), "%3".to_string()]);
+}
+
+#[test]
 fn targets_json_session_prints_stable_valid_json() {
     let s = Scenario::new()
         .resolve_override("%5", Ok(pane_ref_at("%5", "work", "1", "0")))
@@ -1249,4 +1370,24 @@ fn targets_does_not_create_global_current_pointer() {
     assert!(result.is_ok(), "{:?}", result.err());
     assert!(!s.home().join("current").exists());
     assert_eq!(s.home_entry_count(), 1);
+}
+
+#[cfg(unix)]
+fn write_socket_recording_tmux(dir: &Path) -> PathBuf {
+    let argv = dir.join("argv.txt");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > {argv:?}\nprintf '%s\\t%s\\t%s\\t%s\\n' '%5' 'sess' '1' '0'\n"
+    );
+    write_script(dir.join("faketmux"), &script)
+}
+
+#[cfg(unix)]
+fn write_script(path: PathBuf, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(&path, body).unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
 }

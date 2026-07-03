@@ -221,6 +221,7 @@ struct TargetStatusJson {
     session: String,
     window: String,
     pane_index: String,
+    socket: String,
     bound_at: String,
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -240,6 +241,7 @@ impl From<&TargetStatusRow> for TargetStatusJson {
             session: row.target.session.clone(),
             window: row.target.window.clone(),
             pane_index: row.target.pane_index.clone(),
+            socket: row.target.socket.clone(),
             bound_at: row.target.bound_at.clone(),
             status: row.status.as_str(),
             actual_pane: row.actual_pane.clone(),
@@ -441,7 +443,7 @@ pub fn bind(app: &mut App, args: &BindArgs) -> Result<()> {
     let existing = store.find_session_dir(&session_name)?;
 
     // Build the mux only now, then resolve the canonical pane.
-    let mux = (app.new_mux)()?;
+    let mux = (app.new_mux)("")?;
     let pane = mux.resolve_pane(&input)?;
 
     let now = (app.now)();
@@ -514,7 +516,7 @@ pub fn send(app: &mut App, args: &SendArgs) -> Result<()> {
             )
         })?;
 
-    let mux = (app.new_mux)()?;
+    let mux = (app.new_mux)(&target.socket)?;
     let buffer_name = (app.new_buffer_name)();
     let sent = deliver_payload(mux.as_ref(), &target, &payload, &buffer_name, app.sleep)?;
     writeln!(
@@ -555,7 +557,7 @@ pub fn attach(app: &mut App, args: &AttachArgs) -> Result<()> {
         bail!("attach requires TMUX; run from inside tmux");
     }
 
-    let mux = (app.new_mux)()?;
+    let mux = (app.new_mux)("")?;
     mux.has_session(tmux_session)?;
     mux.attach_session_in_new_window(tmux_session, window_name)?;
     writeln!(
@@ -590,6 +592,9 @@ pub fn unbind(app: &mut App, args: &UnbindArgs) -> Result<()> {
     let session_dir = store
         .find_session_dir(&session_name)?
         .ok_or_else(|| anyhow!("no tfmux session \"{session_name}\""))?;
+    if store.load_target(&session_dir, &args.name)?.is_none() {
+        bail!("no target \"{}\" in session {}", args.name, session_name);
+    }
     if !store.delete_target(&session_dir, &args.name)? {
         bail!("no target \"{}\" in session {}", args.name, session_name);
     }
@@ -642,11 +647,11 @@ pub fn targets(app: &mut App, args: &TargetsArgs) -> Result<()> {
         return Ok(());
     }
 
-    let mux = (app.new_mux)()?;
-    let rows = stored_targets
-        .iter()
-        .map(|target| inspect_target_status(mux.as_ref(), target))
-        .collect::<Vec<_>>();
+    let mut rows = Vec::with_capacity(stored_targets.len());
+    for target in &stored_targets {
+        let mux = (app.new_mux)(&target.socket)?;
+        rows.push(inspect_target_status(mux.as_ref(), target));
+    }
     if args.json {
         let json_rows = rows.iter().map(TargetStatusJson::from).collect::<Vec<_>>();
         writeln!(app.out, "{}", serde_json::to_string_pretty(&json_rows)?)?;
