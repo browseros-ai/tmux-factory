@@ -734,12 +734,12 @@ fn resolve_bind_socket(
     let main_socket = resolve_main_socket_name(main_socket);
     for candidate in [flag, env] {
         if let Some(socket) = candidate.map(str::trim).filter(|s| !s.is_empty()) {
-            return normalize_bind_socket(socket, &main_socket);
+            return normalize_selected_bind_socket(socket);
         }
     }
     if derive_from_tmux {
         if let Some(socket) = tmux_socket_basename(tmux)? {
-            return normalize_bind_socket(&socket, &main_socket);
+            return normalize_derived_bind_socket(&socket, &main_socket);
         }
     }
     Ok(String::new())
@@ -772,7 +772,12 @@ fn tmux_socket_basename(tmux: Option<&str>) -> Result<Option<String>> {
     Ok(Some(name.to_string()))
 }
 
-fn normalize_bind_socket(socket: &str, main_socket: &str) -> Result<String> {
+fn normalize_selected_bind_socket(socket: &str) -> Result<String> {
+    validate_name(socket)?;
+    Ok(socket.to_string())
+}
+
+fn normalize_derived_bind_socket(socket: &str, main_socket: &str) -> Result<String> {
     validate_name(socket)?;
     if socket == "default" || socket == main_socket {
         Ok(String::new())

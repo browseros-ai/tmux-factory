@@ -746,6 +746,29 @@ fn bind_uses_socket_from_env_var() {
 }
 
 #[test]
+fn bind_env_default_socket_wins_over_main_socket_override() {
+    let s = Scenario::new()
+        .env("TFMUX_SOCKET", "default")
+        .env("TFMUX_MAIN_SOCKET", "main")
+        .pane("%5", "sess", "1", "0");
+
+    let (result, stdout) = s.run(&[
+        "tfmux",
+        "bind",
+        "agent1",
+        "--tmux",
+        "sess:1.0",
+        "--session",
+        "demo",
+    ]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "bound agent1 -> %5 (sess:1.0)\n");
+    assert_eq!(s.built_sockets(), vec!["default".to_string()]);
+    assert_eq!(s.read_target("demo", "agent1").socket, "default");
+}
+
+#[test]
 fn bind_socket_flag_wins_over_env_and_here_derivation() {
     let s = Scenario::new()
         .env("TFMUX_SOCKET", "envsock")
@@ -768,6 +791,31 @@ fn bind_socket_flag_wins_over_env_and_here_derivation() {
     assert_eq!(stdout, "bound agent1 -> %3 (work:2.1)\n");
     assert_eq!(s.built_sockets(), vec!["flagsock".to_string()]);
     assert_eq!(s.read_target("demo", "agent1").socket, "flagsock");
+}
+
+#[test]
+fn bind_socket_flag_default_wins_over_main_socket_override() {
+    let s = Scenario::new()
+        .env("TFMUX_SOCKET", "envsock")
+        .env("TFMUX_MAIN_SOCKET", "main")
+        .pane("%5", "sess", "1", "0");
+
+    let (result, stdout) = s.run(&[
+        "tfmux",
+        "bind",
+        "agent1",
+        "--tmux",
+        "sess:1.0",
+        "--socket",
+        "default",
+        "--session",
+        "demo",
+    ]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "bound agent1 -> %5 (sess:1.0)\n");
+    assert_eq!(s.built_sockets(), vec!["default".to_string()]);
+    assert_eq!(s.read_target("demo", "agent1").socket, "default");
 }
 
 #[test]
