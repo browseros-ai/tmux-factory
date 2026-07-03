@@ -578,13 +578,10 @@ pub fn attach(app: &mut App, args: &AttachArgs) -> Result<()> {
     }
 
     let env_socket = (app.env)("TFMUX_SOCKET");
-    let main_socket = (app.env)("TFMUX_MAIN_SOCKET");
-    let attach_socket = resolve_socket_selection(
+    let attach_socket = resolve_attach_socket(
         args.socket.as_deref(),
         env_socket.as_deref(),
         in_tmux.as_deref(),
-        true,
-        main_socket.as_deref(),
     )?;
 
     let mux = (app.new_mux)(&attach_socket)?;
@@ -758,6 +755,22 @@ fn resolve_socket_selection(
     Ok(String::new())
 }
 
+fn resolve_attach_socket(
+    flag: Option<&str>,
+    env: Option<&str>,
+    tmux: Option<&str>,
+) -> Result<String> {
+    for candidate in [flag, env] {
+        if let Some(socket) = candidate.map(str::trim).filter(|s| !s.is_empty()) {
+            return normalize_selected_socket(socket);
+        }
+    }
+    if let Some(socket) = tmux_socket_basename(tmux)? {
+        return normalize_derived_attach_socket(&socket);
+    }
+    Ok(String::new())
+}
+
 fn resolve_main_socket_name(value: Option<&str>) -> String {
     value
         .map(str::trim)
@@ -793,6 +806,15 @@ fn normalize_selected_socket(socket: &str) -> Result<String> {
 fn normalize_derived_socket(socket: &str, main_socket: &str) -> Result<String> {
     validate_name(socket)?;
     if socket == "default" || socket == main_socket {
+        Ok(String::new())
+    } else {
+        Ok(socket.to_string())
+    }
+}
+
+fn normalize_derived_attach_socket(socket: &str) -> Result<String> {
+    validate_name(socket)?;
+    if socket == "default" {
         Ok(String::new())
     } else {
         Ok(socket.to_string())

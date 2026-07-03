@@ -551,7 +551,7 @@ fn attach_derived_default_socket_stays_legacy_empty_socket() {
 }
 
 #[test]
-fn attach_derived_main_socket_stays_legacy_empty_socket() {
+fn attach_derived_custom_main_socket_stays_named_socket() {
     let s = Scenario::new()
         .env("TMUX", "/tmp/tmux-501/main,1234,0")
         .env("TFMUX_MAIN_SOCKET", "main");
@@ -560,10 +560,14 @@ fn attach_derived_main_socket_stays_legacy_empty_socket() {
 
     assert!(result.is_ok(), "{:?}", result.err());
     assert_eq!(stdout, "attached \"worker\" in new window \"worker\"\n");
-    assert_eq!(s.built_sockets(), vec!["".to_string()]);
+    assert_eq!(s.built_sockets(), vec!["main".to_string()]);
     assert_eq!(
         s.attached_windows(),
-        vec![("worker".to_string(), "worker".to_string(), "".to_string())]
+        vec![(
+            "worker".to_string(),
+            "worker".to_string(),
+            "main".to_string()
+        )]
     );
 }
 
@@ -676,6 +680,49 @@ fn bind_real_binary_uses_socket_flag_for_pane_resolution() {
             "sess:1.0",
             "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}",
         ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_real_binary_uses_custom_main_socket_for_probe_and_inner_attach() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_tmux = write_multi_call_recording_tmux(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tfmux"))
+        .args(["attach", "worker"])
+        .env("TFMUX_TMUX_BIN", &fake_tmux)
+        .env("TFMUX_MAIN_SOCKET", "main")
+        .env("TMUX", "/tmp/tmux-501/main,1234,0")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "attached \"worker\" in new window \"worker\"\n"
+    );
+
+    let calls = std::fs::read_to_string(dir.path().join("argv.txt")).unwrap();
+    assert_eq!(
+        calls,
+        concat!(
+            "-L\n",
+            "main\n",
+            "has-session\n",
+            "-t\n",
+            "worker\n",
+            "--\n",
+            "new-window\n",
+            "-n\n",
+            "worker\n",
+            "env -u TMUX tmux -L main attach-session -t worker\n",
+            "--\n",
+        )
     );
 }
 
@@ -1692,6 +1739,14 @@ fn write_socket_recording_tmux(dir: &Path) -> PathBuf {
         "#!/bin/sh\nprintf '%s\\n' \"$@\" > {argv:?}\nprintf '%s\\t%s\\t%s\\t%s\\n' '%5' 'sess' '1' '0'\n"
     );
     write_script(dir.join("faketmux"), &script)
+}
+
+#[cfg(unix)]
+fn write_multi_call_recording_tmux(dir: &Path) -> PathBuf {
+    let argv = dir.join("argv.txt");
+    let script =
+        format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> {argv:?}\nprintf '%s\\n' -- >> {argv:?}\n");
+    write_script(dir.join("faketmux-multi"), &script)
 }
 
 #[cfg(unix)]
