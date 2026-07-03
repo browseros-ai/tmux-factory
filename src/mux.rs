@@ -210,13 +210,18 @@ impl Mux for Tmux {
         socket: &str,
     ) -> Result<()> {
         let session = shell_quote(session);
-        let socket = socket.trim();
-        let command = if socket.is_empty() {
+        let requested_socket = socket.trim();
+        let nested_socket = if requested_socket.is_empty() && self.socket != "default" {
+            self.socket.as_str()
+        } else {
+            requested_socket
+        };
+        let command = if nested_socket.is_empty() {
             format!("env -u TMUX tmux attach-session -t {session}")
         } else {
             format!(
                 "env -u TMUX tmux -L {} attach-session -t {session}",
-                shell_quote(socket)
+                shell_quote(nested_socket)
             )
         };
         self.run_ambient(&["new-window", "-n", window_name, &command])?;
@@ -502,6 +507,28 @@ mod tests {
                 "-n",
                 "agent-worker",
                 "env -u TMUX tmux -L factory attach-session -t worker",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attach_session_empty_socket_uses_custom_main_socket_for_inner_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_tmux(dir.path(), "");
+        let tmux = Tmux::new(bin, "", "main");
+
+        tmux.attach_session_in_new_window("worker", "agent-worker", "")
+            .unwrap();
+
+        let args = recorded_args(dir.path());
+        assert_eq!(
+            args,
+            vec![
+                "new-window",
+                "-n",
+                "agent-worker",
+                "env -u TMUX tmux -L main attach-session -t worker",
             ]
         );
     }
