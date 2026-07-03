@@ -525,6 +525,51 @@ fn bind_real_binary_uses_tfmux_main_socket_for_empty_record_socket() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn bind_real_binary_uses_socket_flag_for_pane_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_tmux = write_socket_recording_tmux(dir.path());
+    let home = tempfile::tempdir().unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tfmux"))
+        .args([
+            "bind",
+            "agent1",
+            "--tmux",
+            "sess:1.0",
+            "--socket",
+            "factory",
+            "--session",
+            "demo",
+        ])
+        .env("TFMUX_HOME", home.path())
+        .env("TFMUX_TMUX_BIN", &fake_tmux)
+        .env("TFMUX_MAIN_SOCKET", "main")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let argv = std::fs::read_to_string(dir.path().join("argv.txt")).unwrap();
+    let args = argv.lines().collect::<Vec<_>>();
+    assert_eq!(
+        args,
+        vec![
+            "-L",
+            "factory",
+            "display-message",
+            "-p",
+            "-t",
+            "sess:1.0",
+            "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}",
+        ]
+    );
+}
+
 #[test]
 fn attach_blank_session_errors_before_building_mux_or_writing_state() {
     let s = Scenario::new().env("TMUX", "/tmp/tmux-501/default,1234,0");
@@ -604,6 +649,51 @@ fn bind_here_uses_tmux_pane_and_stores_canonical_pane() {
 }
 
 #[test]
+fn bind_here_derives_socket_from_tmux_socket_path() {
+    let s = Scenario::new()
+        .env("TMUX", "/tmp/tmux-501/factory,1234,0")
+        .env("TMUX_PANE", "%3")
+        .pane("%3", "work", "2", "1");
+
+    let (result, stdout) = s.run(&["tfmux", "bind", "agent1", "--here", "--session", "demo"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "bound agent1 -> %3 (work:2.1)\n");
+    assert_eq!(s.built_sockets(), vec!["factory".to_string()]);
+    assert_eq!(s.resolved(), vec!["%3".to_string()]);
+    assert_eq!(s.read_target("demo", "agent1").socket, "factory");
+}
+
+#[test]
+fn bind_here_default_tmux_socket_stores_empty_socket() {
+    let s = Scenario::new()
+        .env("TMUX", "/tmp/tmux-501/default,1234,0")
+        .env("TMUX_PANE", "%3")
+        .pane("%3", "work", "2", "1");
+
+    let (result, _) = s.run(&["tfmux", "bind", "agent1", "--here", "--session", "demo"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(s.built_sockets(), vec!["".to_string()]);
+    assert_eq!(s.read_target("demo", "agent1").socket, "");
+}
+
+#[test]
+fn bind_here_main_socket_name_stores_empty_socket() {
+    let s = Scenario::new()
+        .env("TMUX", "/tmp/tmux-501/main,1234,0")
+        .env("TMUX_PANE", "%3")
+        .env("TFMUX_MAIN_SOCKET", "main")
+        .pane("%3", "work", "2", "1");
+
+    let (result, _) = s.run(&["tfmux", "bind", "agent1", "--here", "--session", "demo"]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(s.built_sockets(), vec!["".to_string()]);
+    assert_eq!(s.read_target("demo", "agent1").socket, "");
+}
+
+#[test]
 fn bind_tmux_stores_canonical_pane_info() {
     let s = Scenario::new().pane("%5", "sess", "1", "0");
 
@@ -629,6 +719,103 @@ fn bind_tmux_stores_canonical_pane_info() {
     assert_eq!(t.input, "sess:1.0");
     assert_eq!(t.pane_id, "%5");
     assert_eq!(t.session, "sess");
+    assert_eq!(t.socket, "");
+    assert_eq!(s.built_sockets(), vec!["".to_string()]);
+}
+
+#[test]
+fn bind_uses_socket_from_env_var() {
+    let s = Scenario::new()
+        .env("TFMUX_SOCKET", "factory")
+        .pane("%5", "sess", "1", "0");
+
+    let (result, stdout) = s.run(&[
+        "tfmux",
+        "bind",
+        "agent1",
+        "--tmux",
+        "sess:1.0",
+        "--session",
+        "demo",
+    ]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "bound agent1 -> %5 (sess:1.0)\n");
+    assert_eq!(s.built_sockets(), vec!["factory".to_string()]);
+    assert_eq!(s.read_target("demo", "agent1").socket, "factory");
+}
+
+#[test]
+fn bind_env_default_socket_wins_over_main_socket_override() {
+    let s = Scenario::new()
+        .env("TFMUX_SOCKET", "default")
+        .env("TFMUX_MAIN_SOCKET", "main")
+        .pane("%5", "sess", "1", "0");
+
+    let (result, stdout) = s.run(&[
+        "tfmux",
+        "bind",
+        "agent1",
+        "--tmux",
+        "sess:1.0",
+        "--session",
+        "demo",
+    ]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "bound agent1 -> %5 (sess:1.0)\n");
+    assert_eq!(s.built_sockets(), vec!["default".to_string()]);
+    assert_eq!(s.read_target("demo", "agent1").socket, "default");
+}
+
+#[test]
+fn bind_socket_flag_wins_over_env_and_here_derivation() {
+    let s = Scenario::new()
+        .env("TFMUX_SOCKET", "envsock")
+        .env("TMUX", "/tmp/tmux-501/factory,1234,0")
+        .env("TMUX_PANE", "%3")
+        .pane("%3", "work", "2", "1");
+
+    let (result, stdout) = s.run(&[
+        "tfmux",
+        "bind",
+        "agent1",
+        "--here",
+        "--socket",
+        "flagsock",
+        "--session",
+        "demo",
+    ]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "bound agent1 -> %3 (work:2.1)\n");
+    assert_eq!(s.built_sockets(), vec!["flagsock".to_string()]);
+    assert_eq!(s.read_target("demo", "agent1").socket, "flagsock");
+}
+
+#[test]
+fn bind_socket_flag_default_wins_over_main_socket_override() {
+    let s = Scenario::new()
+        .env("TFMUX_SOCKET", "envsock")
+        .env("TFMUX_MAIN_SOCKET", "main")
+        .pane("%5", "sess", "1", "0");
+
+    let (result, stdout) = s.run(&[
+        "tfmux",
+        "bind",
+        "agent1",
+        "--tmux",
+        "sess:1.0",
+        "--socket",
+        "default",
+        "--session",
+        "demo",
+    ]);
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(stdout, "bound agent1 -> %5 (sess:1.0)\n");
+    assert_eq!(s.built_sockets(), vec!["default".to_string()]);
+    assert_eq!(s.read_target("demo", "agent1").socket, "default");
 }
 
 #[test]

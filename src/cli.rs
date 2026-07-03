@@ -4,6 +4,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use std::fs;
+use std::path::Path;
 use std::time::Duration;
 
 use crate::app::App;
@@ -57,6 +58,9 @@ pub struct BindArgs {
     /// Override session selection.
     #[arg(long, value_name = "NAME")]
     pub session: Option<String>,
+    /// tmux socket name for pane resolution and the stored target record.
+    #[arg(long, value_name = "NAME")]
+    pub socket: Option<String>,
     /// Print the stored target as JSON instead of the text summary.
     #[arg(long)]
     pub json: bool,
@@ -418,11 +422,15 @@ pub fn bind(app: &mut App, args: &BindArgs) -> Result<()> {
 
     // Resolve the tmux input string. For `--here` this validates the tmux env
     // *before* the mux is built, so that failure path never shells out.
-    let input = if args.here {
-        let in_tmux = (app.env)("TMUX")
+    let tmux_env = if args.here {
+        (app.env)("TMUX")
             .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        if in_tmux.is_none() {
+            .filter(|v| !v.is_empty())
+    } else {
+        None
+    };
+    let input = if args.here {
+        if tmux_env.is_none() {
             bail!("--here requires TMUX and TMUX_PANE; run from inside tmux or use --tmux TARGET");
         }
         match (app.env)("TMUX_PANE")
@@ -437,13 +445,22 @@ pub fn bind(app: &mut App, args: &BindArgs) -> Result<()> {
             .expect("xor check guarantees a tmux target")
             .to_string()
     };
+    let env_socket = (app.env)("TFMUX_SOCKET");
+    let main_socket = (app.env)("TFMUX_MAIN_SOCKET");
+    let bind_socket = resolve_bind_socket(
+        args.socket.as_deref(),
+        env_socket.as_deref(),
+        tmux_env.as_deref(),
+        args.here,
+        main_socket.as_deref(),
+    )?;
 
     // Look up an existing session before doing anything that writes.
     let store = Store::new(app.base_dir.clone());
     let existing = store.find_session_dir(&session_name)?;
 
     // Build the mux only now, then resolve the canonical pane.
-    let mux = (app.new_mux)("")?;
+    let mux = (app.new_mux)(&bind_socket)?;
     let pane = mux.resolve_pane(&input)?;
 
     let now = (app.now)();
@@ -456,7 +473,7 @@ pub fn bind(app: &mut App, args: &BindArgs) -> Result<()> {
         session: pane.session,
         window: pane.window,
         pane_index: pane.pane_index,
-        socket: String::new(),
+        socket: bind_socket,
         bound_at: rfc3339(now),
     };
 
@@ -705,6 +722,68 @@ fn has_flag_or_env_session(flag: Option<&str>, env: Option<&str>) -> bool {
         .into_iter()
         .flatten()
         .any(|candidate| !candidate.trim().is_empty())
+}
+
+fn resolve_bind_socket(
+    flag: Option<&str>,
+    env: Option<&str>,
+    tmux: Option<&str>,
+    derive_from_tmux: bool,
+    main_socket: Option<&str>,
+) -> Result<String> {
+    let main_socket = resolve_main_socket_name(main_socket);
+    for candidate in [flag, env] {
+        if let Some(socket) = candidate.map(str::trim).filter(|s| !s.is_empty()) {
+            return normalize_selected_bind_socket(socket);
+        }
+    }
+    if derive_from_tmux {
+        if let Some(socket) = tmux_socket_basename(tmux)? {
+            return normalize_derived_bind_socket(&socket, &main_socket);
+        }
+    }
+    Ok(String::new())
+}
+
+fn resolve_main_socket_name(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default")
+        .to_string()
+}
+
+fn tmux_socket_basename(tmux: Option<&str>) -> Result<Option<String>> {
+    let Some(socket_path) = tmux
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(name) = Path::new(socket_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(name.to_string()))
+}
+
+fn normalize_selected_bind_socket(socket: &str) -> Result<String> {
+    validate_name(socket)?;
+    Ok(socket.to_string())
+}
+
+fn normalize_derived_bind_socket(socket: &str, main_socket: &str) -> Result<String> {
+    validate_name(socket)?;
+    if socket == "default" || socket == main_socket {
+        Ok(String::new())
+    } else {
+        Ok(socket.to_string())
+    }
 }
 
 fn no_send_session_selected() -> anyhow::Error {
