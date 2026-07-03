@@ -23,7 +23,7 @@ pub struct App<'a> {
     pub now: &'a dyn Fn() -> DateTime<Utc>,
     /// Lazily-built tmux backend (constructed only when a command needs it, so
     /// pure-validation failure paths never shell out to tmux).
-    pub new_mux: &'a dyn Fn() -> Result<Box<dyn Mux>>,
+    pub new_mux: &'a dyn Fn(&str) -> Result<Box<dyn Mux>>,
     /// Read all text from stdin when a command explicitly asks for `-`.
     pub read_stdin: &'a dyn Fn() -> Result<String>,
     /// Generate a tmux buffer name for one send attempt.

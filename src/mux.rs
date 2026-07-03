@@ -50,25 +50,30 @@ pub trait Mux {
 /// Real tmux backend that shells out to the `tmux` binary.
 pub struct Tmux {
     bin: PathBuf,
+    socket: String,
 }
 
 impl Tmux {
-    /// Construct from an explicit binary path (used by tests and `from_env`).
-    pub fn new(bin: PathBuf) -> Self {
-        Self { bin }
+    /// Construct from an explicit binary path and resolved socket settings.
+    pub fn new(bin: PathBuf, socket: &str, main_socket: &str) -> Self {
+        Self {
+            bin,
+            socket: resolve_socket(socket, main_socket),
+        }
     }
 
     /// Resolve the tmux binary from `TFMUX_TMUX_BIN` (else `tmux`) on `PATH`.
-    pub fn from_env() -> Result<Self> {
+    pub fn from_env(socket: &str) -> Result<Self> {
         let name = std::env::var("TFMUX_TMUX_BIN")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "tmux".to_string());
+        let main_socket = std::env::var("TFMUX_MAIN_SOCKET").unwrap_or_default();
         let bin = which::which(&name).map_err(|e| {
             anyhow!("tmux binary \"{name}\" not found; install tmux or set TFMUX_TMUX_BIN: {e}")
         })?;
-        Ok(Self::new(bin))
+        Ok(Self::new(bin, socket, &main_socket))
     }
 
     /// Run the tmux binary with `args`, returning stdout on success.
@@ -79,6 +84,21 @@ impl Tmux {
 
     /// Run the tmux binary with optional stdin, returning stdout on success.
     fn run_with_stdin(&self, args: &[&str], stdin: Option<&str>) -> Result<String> {
+        let mut full_args = Vec::with_capacity(args.len() + 2);
+        full_args.push("-L");
+        full_args.push(self.socket.as_str());
+        full_args.extend_from_slice(args);
+        let sub = args.first().copied().unwrap_or("tmux");
+        self.run_raw(&full_args, stdin, sub)
+    }
+
+    /// Run tmux without socket routing for command surfaces not in this slice.
+    fn run_ambient(&self, args: &[&str]) -> Result<String> {
+        let sub = args.first().copied().unwrap_or("tmux");
+        self.run_raw(args, None, sub)
+    }
+
+    fn run_raw(&self, args: &[&str], stdin: Option<&str>, sub: &str) -> Result<String> {
         let mut child = Command::new(&self.bin)
             .args(args)
             .stdin(if stdin.is_some() {
@@ -107,11 +127,24 @@ impl Tmux {
         let mut detail = String::from_utf8_lossy(&output.stdout).into_owned();
         detail.push_str(&String::from_utf8_lossy(&output.stderr));
         let detail = detail.trim();
-        let sub = args.first().copied().unwrap_or("tmux");
         if detail.is_empty() {
             bail!("tmux {sub} failed");
         }
         bail!("tmux {sub} failed: {detail}");
+    }
+}
+
+fn resolve_socket(socket: &str, main_socket: &str) -> String {
+    let socket = socket.trim();
+    if !socket.is_empty() {
+        return socket.to_string();
+    }
+
+    let main_socket = main_socket.trim();
+    if main_socket.is_empty() {
+        "default".to_string()
+    } else {
+        main_socket.to_string()
     }
 }
 
@@ -161,7 +194,9 @@ impl Mux for Tmux {
     }
 
     fn has_session(&self, session: &str) -> Result<()> {
-        self.run(&["has-session", "-t", session])?;
+        // Attach socket selection is a later feature; keep this ambient so the
+        // current tmux client/server behavior stays byte-compatible.
+        self.run_ambient(&["has-session", "-t", session])?;
         Ok(())
     }
 
@@ -170,7 +205,7 @@ impl Mux for Tmux {
             "env -u TMUX tmux attach-session -t {}",
             shell_quote(session)
         );
-        self.run(&["new-window", "-n", window_name, &command])?;
+        self.run_ambient(&["new-window", "-n", window_name, &command])?;
         Ok(())
     }
 }
@@ -257,7 +292,7 @@ mod tests {
     fn resolve_pane_issues_exact_display_message_argv() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_fake_tmux(dir.path(), b"%5\tsess\t1\t0\n");
-        let tmux = Tmux::new(bin);
+        let tmux = Tmux::new(bin, "", "default");
 
         let r = tmux.resolve_pane("sess:1.0").unwrap();
         assert_eq!(r.pane_id, "%5");
@@ -271,6 +306,8 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                "-L",
+                "default",
                 "display-message",
                 "-p",
                 "-t",
@@ -285,7 +322,7 @@ mod tests {
     fn resolve_pane_surfaces_command_failure_detail() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_failing_tmux(dir.path(), "unknown pane: bogus");
-        let tmux = Tmux::new(bin);
+        let tmux = Tmux::new(bin, "", "default");
 
         let err = tmux.resolve_pane("bogus").unwrap_err().to_string();
         assert!(err.contains("unknown pane: bogus"), "got: {err}");
@@ -294,7 +331,7 @@ mod tests {
     #[test]
     fn resolve_pane_rejects_empty_target() {
         // Empty target must fail before any subprocess runs.
-        let tmux = Tmux::new(PathBuf::from("/nonexistent/tmux"));
+        let tmux = Tmux::new(PathBuf::from("/nonexistent/tmux"), "", "default");
         let err = tmux.resolve_pane("   ").unwrap_err().to_string();
         assert!(err.contains("tmux target is required"), "got: {err}");
     }
@@ -304,12 +341,15 @@ mod tests {
     fn load_buffer_issues_exact_argv_and_writes_payload_to_stdin() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_recording_tmux(dir.path(), "");
-        let tmux = Tmux::new(bin);
+        let tmux = Tmux::new(bin, "", "default");
 
         tmux.load_buffer("tfmux-agent1", "hello\nworld").unwrap();
 
         let args = recorded_args(dir.path());
-        assert_eq!(args, vec!["load-buffer", "-b", "tfmux-agent1", "-"]);
+        assert_eq!(
+            args,
+            vec!["-L", "default", "load-buffer", "-b", "tfmux-agent1", "-"]
+        );
         let stdin = fs::read_to_string(dir.path().join("stdin.txt")).unwrap();
         assert_eq!(stdin, "hello\nworld");
     }
@@ -319,14 +359,24 @@ mod tests {
     fn paste_buffer_issues_exact_argv() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_recording_tmux(dir.path(), "");
-        let tmux = Tmux::new(bin);
+        let tmux = Tmux::new(bin, "", "default");
 
         tmux.paste_buffer("tfmux-agent1", "%5").unwrap();
 
         let args = recorded_args(dir.path());
         assert_eq!(
             args,
-            vec!["paste-buffer", "-d", "-p", "-b", "tfmux-agent1", "-t", "%5",]
+            vec![
+                "-L",
+                "default",
+                "paste-buffer",
+                "-d",
+                "-p",
+                "-b",
+                "tfmux-agent1",
+                "-t",
+                "%5",
+            ]
         );
     }
 
@@ -335,12 +385,15 @@ mod tests {
     fn send_enter_issues_exact_argv() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_recording_tmux(dir.path(), "");
-        let tmux = Tmux::new(bin);
+        let tmux = Tmux::new(bin, "", "default");
 
         tmux.send_enter("%5").unwrap();
 
         let args = recorded_args(dir.path());
-        assert_eq!(args, vec!["send-keys", "-t", "%5", "Enter"]);
+        assert_eq!(
+            args,
+            vec!["-L", "default", "send-keys", "-t", "%5", "Enter"]
+        );
     }
 
     #[cfg(unix)]
@@ -348,13 +401,25 @@ mod tests {
     fn capture_pane_issues_exact_argv_and_returns_stdout() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_recording_tmux(dir.path(), "captured\n");
-        let tmux = Tmux::new(bin);
+        let tmux = Tmux::new(bin, "", "default");
 
         let output = tmux.capture_pane("%5", 80).unwrap();
 
         assert_eq!(output, "captured\n");
         let args = recorded_args(dir.path());
-        assert_eq!(args, vec!["capture-pane", "-p", "-t", "%5", "-S", "-80"]);
+        assert_eq!(
+            args,
+            vec![
+                "-L",
+                "default",
+                "capture-pane",
+                "-p",
+                "-t",
+                "%5",
+                "-S",
+                "-80"
+            ]
+        );
     }
 
     #[cfg(unix)]
@@ -362,7 +427,7 @@ mod tests {
     fn has_session_issues_exact_argv() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_recording_tmux(dir.path(), "");
-        let tmux = Tmux::new(bin);
+        let tmux = Tmux::new(bin, "", "default");
 
         tmux.has_session("worker").unwrap();
 
@@ -375,7 +440,7 @@ mod tests {
     fn has_session_surfaces_command_failure_detail() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_failing_tmux(dir.path(), "no such session: worker");
-        let tmux = Tmux::new(bin);
+        let tmux = Tmux::new(bin, "", "default");
 
         let err = tmux.has_session("worker").unwrap_err().to_string();
 
@@ -388,7 +453,7 @@ mod tests {
     fn attach_session_in_new_window_issues_exact_argv() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_recording_tmux(dir.path(), "");
-        let tmux = Tmux::new(bin);
+        let tmux = Tmux::new(bin, "", "default");
 
         tmux.attach_session_in_new_window("worker", "agent-worker")
             .unwrap();
@@ -410,7 +475,7 @@ mod tests {
     fn attach_session_quotes_nested_session_argument() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_recording_tmux(dir.path(), "");
-        let tmux = Tmux::new(bin);
+        let tmux = Tmux::new(bin, "", "default");
 
         tmux.attach_session_in_new_window("work session's $main", "agent")
             .unwrap();
@@ -432,12 +497,44 @@ mod tests {
     fn delete_buffer_issues_exact_argv() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_recording_tmux(dir.path(), "");
-        let tmux = Tmux::new(bin);
+        let tmux = Tmux::new(bin, "", "default");
 
         tmux.delete_buffer("tfmux-agent1").unwrap();
 
         let args = recorded_args(dir.path());
-        assert_eq!(args, vec!["delete-buffer", "-b", "tfmux-agent1"]);
+        assert_eq!(
+            args,
+            vec!["-L", "default", "delete-buffer", "-b", "tfmux-agent1"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_empty_socket_prefixes_that_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_tmux(dir.path(), "");
+        let tmux = Tmux::new(bin, "factory", "default");
+
+        tmux.send_enter("%5").unwrap();
+
+        let args = recorded_args(dir.path());
+        assert_eq!(
+            args,
+            vec!["-L", "factory", "send-keys", "-t", "%5", "Enter"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_socket_uses_main_socket_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_recording_tmux(dir.path(), "");
+        let tmux = Tmux::new(bin, "", "main");
+
+        tmux.send_enter("%5").unwrap();
+
+        let args = recorded_args(dir.path());
+        assert_eq!(args, vec!["-L", "main", "send-keys", "-t", "%5", "Enter"]);
     }
 
     // ---- fake-binary helpers ----

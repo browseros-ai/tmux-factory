@@ -18,6 +18,9 @@ pub struct Target {
     pub session: String,
     pub window: String,
     pub pane_index: String,
+    /// tmux socket name; empty means the configured main/default socket.
+    #[serde(default)]
+    pub socket: String,
     /// RFC3339 UTC timestamp of the bind.
     pub bound_at: String,
 }

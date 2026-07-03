@@ -227,6 +227,7 @@ mod tests {
             session: "sess".into(),
             window: "1".into(),
             pane_index: "0".into(),
+            socket: String::new(),
             bound_at: "2026-06-28T12:00:00Z".into(),
         }
     }
@@ -405,6 +406,7 @@ mod tests {
             "session",
             "window",
             "pane_index",
+            "socket",
             "bound_at",
         ];
         let mut last = 0usize;
@@ -429,6 +431,34 @@ mod tests {
 
         let loaded = store.load_target(&dir, "agent1").unwrap();
         assert_eq!(loaded, Some(target));
+    }
+
+    #[test]
+    fn load_legacy_target_without_socket_defaults_to_empty() {
+        let base = tempfile::tempdir().unwrap();
+        let store = Store::new(base.path().to_path_buf());
+        let dir = store.create_session("demo", fixed_now()).unwrap();
+        fs::create_dir_all(dir.join("targets")).unwrap();
+        fs::write(
+            dir.join("targets/agent1.json"),
+            r#"{
+  "name": "agent1",
+  "role": "agent",
+  "kind": "claude",
+  "input": "sess:1.0",
+  "pane_id": "%5",
+  "session": "sess",
+  "window": "1",
+  "pane_index": "0",
+  "bound_at": "2026-06-28T12:00:00Z"
+}
+"#,
+        )
+        .unwrap();
+
+        let loaded = store.load_target(&dir, "agent1").unwrap().unwrap();
+
+        assert_eq!(loaded.socket, "");
     }
 
     #[test]

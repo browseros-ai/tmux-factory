@@ -27,7 +27,8 @@ fn main() -> ExitCode {
 
     let env_fn = |k: &str| std::env::var(k).ok();
     let now_fn = || Utc::now();
-    let new_mux = || -> anyhow::Result<Box<dyn Mux>> { Ok(Box::new(Tmux::from_env()?)) };
+    let new_mux =
+        |socket: &str| -> anyhow::Result<Box<dyn Mux>> { Ok(Box::new(Tmux::from_env(socket)?)) };
     let read_stdin = || -> anyhow::Result<String> {
         let mut buf = String::new();
         io::stdin().read_to_string(&mut buf)?;
@@ -64,7 +65,8 @@ fn main() -> ExitCode {
 fn run_attach(cli: Cli) -> ExitCode {
     let env_fn = |k: &str| std::env::var(k).ok();
     let now_fn = || Utc::now();
-    let new_mux = || -> anyhow::Result<Box<dyn Mux>> { Ok(Box::new(Tmux::from_env()?)) };
+    let new_mux =
+        |socket: &str| -> anyhow::Result<Box<dyn Mux>> { Ok(Box::new(Tmux::from_env(socket)?)) };
     let read_stdin = || -> anyhow::Result<String> { Ok(String::new()) };
     let new_buffer_name = || -> String { String::new() };
     let sleep = |_duration| {};
