@@ -1,0 +1,4 @@
+interface:
+  display_name: "tmux-factory-codex-go"
+  short_description: "Fire-and-get-pinged codex software factory over tfmux"
+  default_prompt: "Use $tmux-factory-codex-go to launch a codex software-factory run for this feature in its own worktree and ping me when it squash-merges."
