@@ -44,14 +44,15 @@ git clone https://github.com/browseros-ai/tmux-factory && cd tmux-factory
 ```
 
 `install.sh` cargo-installs the `tfmux` binary and copies the three skills into
-`~/.claude/skills/`. No Rust yet? Install it first, then rerun:
-`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+`~/.claude/skills/`. No Rust? Run `curl --proto '=https' --tlsv1.2 -sSf
+https://sh.rustup.rs | sh` first, then rerun `./install.sh`.
 
 **3. Start Claude inside tmux and fire a task.**
 
 ```bash
-tmux      # open a tmux session
-claude    # start Claude Code in any git repo
+tmux            # open a tmux session
+cd <your-repo>  # any git repo
+claude          # start Claude Code
 ```
 
 ```text
@@ -71,7 +72,7 @@ worker runs detached — you keep working. When it lands, a line arrives in your
 pane as if someone typed it there:
 
 ```text
-merged: add --json flag to targets (PR #42, squash-merged to main)
+targets-json merged: https://github.com/you/repo/pull/43
 ```
 
 Then `git pull` and keep going. `/tmux-factory-codex-go` needs `gh` installed and
