@@ -14,7 +14,11 @@ description: Fire-and-get-pinged software factory (tmux-factory edition). You st
 
 Spin up codex in its own worktree running `$sf-auto` (design → implement → review → open PR → **squash-merge to main**), deliver the task over **`tfmux`**, and bind **your** pane as the tfmux **mediator** so codex pings you when done. A bundled script does every mechanical step in one shot — worktree → quarantine hook-copied `.llm` → `dotllm trust` + `init` → bind mediator → spawn → **verified `tfmux send`** → arm the done-ping — so you're back on `main` the moment it returns.
 
-**Run from inside the repo you want to build in, on `main`.**
+**Run from inside the repo you want to build in, on `main`** for the normal isolated-worktree + PR flow.
+
+## Outside a git repo
+
+If the current directory is not inside a git repo, the launcher degrades to in-place mode: no branch, worktree, PR, or squash-merge is created, codex starts with cwd set to the directory where you fired the command, dotllm setup is best-effort, and a done/blocked `tfmux send mediator` ping is still armed. Broken git metadata or other git errors fail loudly instead of falling back. The launch notice says there is no worktree isolation because codex edits that directory directly.
 
 ## Do this
 
@@ -55,8 +59,8 @@ tfmux send mediator --session tfmux-<slug> --text '✅ <slug> merged: <PR url>' 
 That line lands in **your** pane. **Stay idle to catch it.** Ping-back needs you **in tmux** (the script binds your pane via `--here`); if you're not, the script warns and degrades to fire-and-forget — then you check the PR yourself.
 
 ## Prerequisites (check once)
-- **`tfmux` — REQUIRED** (delivers the task *and* carries the ping-back). `wt`, `tmux`, `dotllm`, `git`, `python3` on PATH too — the script preflights all.
-- `gh` authenticated — codex opens + squash-merges the PR, and the cleanup helper verifies the merged PR; the script preflights that a git **remote** exists.
+- **`tfmux` — REQUIRED** (delivers the task *and* carries the ping-back). `tmux` on PATH too. In git mode, `wt`, `dotllm`, `git`, and `python3` are preflighted; outside git, dotllm is tried only best-effort.
+- `gh` authenticated in git mode — codex opens + squash-merges the PR, and the cleanup helper verifies the merged PR; the script preflights that a git **remote** exists. Outside git, there is no PR or squash-merge.
 - The **`shadowfax`** bundle loaded — codex needs `$sf-auto` in `~/.codex/skills/`.
 - **Ping-back needs you in tmux.** Not in tmux → no mediator pane → no ping; the script warns.
 

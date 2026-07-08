@@ -16,7 +16,11 @@ Spin up Claude Code in its own worktree as a detached tmux session, deliver the 
 
 **This actually runs the task or fails clearly.** The launcher delivers via `tfmux send` (bracketed paste + Enter), then confirms Claude left the idle composer and started work. If delivery can't be confirmed after retries, it kills the unstarted session, leaves the worktree for inspection, and exits non-zero. (For the full design → implement → review → squash-merge loop on **codex**, use **`tmux-factory-codex-go`**.)
 
-**Run from inside the repo you want to work on, on `main`** — and ideally inside tmux (the ping-back binds your pane).
+**Run from inside the repo you want to work on, on `main`** for the normal isolated-worktree flow — and ideally inside tmux (the ping-back binds your pane).
+
+## Outside a git repo
+
+If the current directory is not inside a git repo, the launcher degrades to in-place mode: no branch or worktree is created, Claude starts with cwd set to the directory where you fired the command, dotllm setup is best-effort, and the same done/blocked `tfmux send mediator` ping is armed. Broken git metadata or other git errors fail loudly instead of falling back. The launch notice says there is no worktree isolation because Claude edits that directory directly.
 
 ## Do this
 
@@ -57,7 +61,7 @@ tfmux send mediator --session tfmux-<slug> --text '✅ <slug> done: <one-line su
 That line lands in **your** pane. **Stay idle to catch it.** Ping-back needs you **in tmux** (the script binds your pane via `--here`); if you're not, the script warns and degrades to fire-and-forget — then you check the worktree yourself.
 
 ## Prerequisites (check once)
-- **`tfmux` — REQUIRED** (delivers the task *and* carries the ping-back). `wt`, `tmux`, `dotllm`, `git`, `python3` on PATH too — the script preflights all.
+- **`tfmux` — REQUIRED** (delivers the task *and* carries the ping-back). `tmux` on PATH too. In git mode, `wt`, `dotllm`, `git`, and `python3` are preflighted; outside git, dotllm is tried only best-effort.
 - `claudex` alias resolvable in your agent shell for default `max` launches (`zsh -ic 'type claudex'` is the check); `claude` on PATH for non-`max` efforts; or set `SF_CLAUDEGO_CMD`.
 - The cleanup step needs `gh` authenticated so the shared helper can verify the merged PR before deleting the worktree.
 - **Ping-back needs you in tmux.** Not in tmux → no mediator pane → no ping; the script warns and still delivers the task.
