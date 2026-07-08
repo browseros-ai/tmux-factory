@@ -14,11 +14,7 @@ type one line:
 
 and get back to what you were doing. A codex worker spins up in its own git
 worktree: designs, implements, reviews, opens a PR, squash-merges to main.
-Minutes later a line lands in *your* pane:
-
-```text
-dark-mode merged: https://github.com/you/repo/pull/42
-```
+Minutes later a line lands in *your* pane: `dark-mode merged: <PR url>`.
 
 Fire three at once; each reports back on its own. Your session stays clean — the
 orchestrator plans, the workers burn the tokens.
@@ -27,38 +23,46 @@ orchestrator plans, the workers burn the tokens.
 
 ## Install
 
-macOS and Linux. Three steps.
+macOS and Linux. Four steps.
 
-**1. Install tmux.**
+**1. 📦 Install tmux.**
 
 ```bash
 brew install tmux         # macOS
 sudo apt install tmux     # Linux (Debian/Ubuntu)
 ```
 
-**2. Install tfmux and the skills.**
+**2. 🔧 Install tfmux and the skills.**
 
 ```bash
-git clone https://github.com/browseros-ai/tmux-factory && cd tmux-factory
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/browseros-ai/tmux-factory/main/install.sh | bash
 ```
 
-`install.sh` cargo-installs the `tfmux` binary and copies the two skills into
-both `~/.claude/skills/` and `~/.codex/skills/`. No Rust? Run
-`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` first, then
-rerun `./install.sh`.
+Downloads the prebuilt `tfmux` binary from GitHub Releases (macOS/Linux) and
+installs the two skills into `~/.claude/skills/` and `~/.codex/skills/`. No
+prebuilt binary for your platform? It falls back to `cargo` when present.
 
-**3. Start Claude inside tmux and fire a task.**
+**3. 🖥️ Start a tmux session, then start Claude inside it.**
 
 ```bash
-tmux            # open a tmux session
-cd <your-repo>  # any git repo
-claude          # start Claude Code
+tmux      # open a tmux session first
+claude    # then start Claude Code inside it (from any repo or directory)
 ```
+
+**4. 🚀 Done — fire a task.**
 
 ```text
 /tmux-factory-codex-go <your feature>
 ```
+
+<details>
+<summary><b>Build from source</b></summary>
+
+```bash
+git clone https://github.com/browseros-ai/tmux-factory && cd tmux-factory && ./install.sh
+```
+
+</details>
 
 ## The skills
 
@@ -78,8 +82,14 @@ targets-json merged: https://github.com/you/repo/pull/43
 Then `git pull` and keep going. `/tmux-factory-codex-go` needs `gh` installed and
 authenticated.
 
-**See it run first.** From inside tmux, `./demo.sh` spins up three workers that
-report in without a single poll (tear down with `tmux kill-session -t tfmux-demo`).
+Both skills also work outside a git repo — the worker runs the task in your
+current directory and still pings your pane when done (`codex-go` skips the
+PR/squash-merge in that mode).
+
+**See it run first.** From inside tmux,
+`git clone https://github.com/browseros-ai/tmux-factory && cd tmux-factory && ./demo.sh`
+spins up three workers that report in without a single poll (tear down with
+`tmux kill-session -t tfmux-demo`).
 
 ![tmux-factory demo](assets/demo.gif)
 
