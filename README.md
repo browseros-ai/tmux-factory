@@ -86,8 +86,10 @@ Both skills also work outside a git repo — the worker runs the task in your
 current directory and still pings your pane when done (`codex-go` skips the
 PR/squash-merge in that mode).
 
-**See it run first.** From inside tmux, `./demo.sh` spins up three workers that
-report in without a single poll (tear down with `tmux kill-session -t tfmux-demo`).
+**See it run first.** From inside tmux,
+`git clone https://github.com/browseros-ai/tmux-factory && cd tmux-factory && ./demo.sh`
+spins up three workers that report in without a single poll (tear down with
+`tmux kill-session -t tfmux-demo`).
 
 ![tmux-factory demo](assets/demo.gif)
 
