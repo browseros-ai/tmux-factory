@@ -43,9 +43,10 @@ git clone https://github.com/browseros-ai/tmux-factory && cd tmux-factory
 ./install.sh
 ```
 
-`install.sh` cargo-installs the `tfmux` binary and copies the three skills into
-`~/.claude/skills/`. No Rust? Run `curl --proto '=https' --tlsv1.2 -sSf
-https://sh.rustup.rs | sh` first, then rerun `./install.sh`.
+`install.sh` cargo-installs the `tfmux` binary and copies the two skills into
+both `~/.claude/skills/` and `~/.codex/skills/`. No Rust? Run
+`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` first, then
+rerun `./install.sh`.
 
 **3. Start Claude inside tmux and fire a task.**
 
@@ -64,7 +65,6 @@ claude          # start Claude Code
 | Skill | What it does |
 |---|---|
 | `/tmux-factory-claude-go <task>` | Fire a Claude Code session in a worktree; get pinged done or blocked. |
-| `/tmux-factory-claude-opus-go <task>` | The same, on Opus at max effort. |
 | `/tmux-factory-codex-go <feature>` | Full loop: design, implement, review, open PR, squash-merge to main, then ping. |
 
 The first time you fire one, your pane is bound as the tfmux mediator and the
@@ -93,9 +93,9 @@ Two pieces:
 - **`tfmux`** — a small synchronous Rust CLI that names tmux panes, delivers work
   into them (buffer, paste, Enter, then verifies the payload landed), and lets any
   pane send a line back to the mediator pane.
-- **The skills** — `/tmux-factory-claude-go`, `/tmux-factory-claude-opus-go`,
-  `/tmux-factory-codex-go`. Each spins up a worktree, spawns a detached agent
-  session, delivers the task, and arms a ping back to your pane.
+- **The skills** — `/tmux-factory-claude-go` and `/tmux-factory-codex-go`. Each
+  spins up a worktree, spawns a detached agent session, delivers the task, and
+  arms a ping back to your pane.
 
 No daemon, no polling, no inbox or dashboard. State is a few JSON files under
 `~/.tfmux`.
@@ -130,16 +130,16 @@ the first one missing.
 
 | Assumed on `PATH` | Used for | Skills |
 |---|---|---|
-| `git`, `tmux`, `tfmux`, `python3` | worktree, panes, delivery, path resolution | all three |
-| `wt` | creating the `feat/<slug>` worktree | all three |
-| `dotllm` | giving the worktree a `.llm/` scratch directory | all three |
+| `git`, `tmux`, `tfmux`, `python3` | worktree, panes, delivery, path resolution | both skills |
+| `wt` | creating the `feat/<slug>` worktree | both skills |
+| `dotllm` | giving the worktree a `.llm/` scratch directory | both skills |
 | `gh`, authenticated | opening and squash-merging the PR | `codex-go` |
 
 Two assumptions are not probed by `command -v`:
 
 - **Launch aliases.** At its default effort each launcher spawns a shell alias —
-  `claudex`, `claudeo`, `codexy` — through `$SHELL -ic`. Pass `--effort` below the
-  default to invoke `claude`/`codex` directly, or override with `SF_CLAUDEGO_CMD` /
+  `claudex` or `codexy` — through `$SHELL -ic`. Pass `--effort` below the default
+  to invoke `claude`/`codex` directly, or override with `SF_CLAUDEGO_CMD` /
   `SF_CODEXGO_CMD`.
 - **`codex-go` needs the `shadowfax` bundle**, which supplies the `$sf-auto` loop
   in `~/.codex/skills/`. Without it codex gets the task but has no loop to run.
