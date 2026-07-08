@@ -6,8 +6,8 @@ usage() {
 Usage: ./install.sh [--force]
 
 Installs tfmux with cargo and copies packaged tmux-factory skills into
-$HOME/.claude/skills. Existing skill directories are skipped unless --force is
-provided.
+$HOME/.claude/skills and $HOME/.codex/skills. Existing skill directories are
+skipped unless --force is provided.
 USAGE
 }
 
@@ -31,7 +31,10 @@ done
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 skills_src="$script_dir/skills"
-skills_dest="$HOME/.claude/skills"
+skill_dest_roots=(
+  "$HOME/.claude/skills"
+  "$HOME/.codex/skills"
+)
 
 missing_required=0
 if ! command -v tmux >/dev/null 2>&1; then
@@ -51,7 +54,7 @@ if [[ "$missing_required" -ne 0 ]]; then
 fi
 
 if ! command -v claude >/dev/null 2>&1; then
-  echo "warn: claude CLI not found; tmux-factory-claude-* skills need Claude Code." >&2
+  echo "warn: claude CLI not found; tmux-factory-claude-go needs Claude Code." >&2
   echo "      Install Claude Code: https://docs.anthropic.com/en/docs/claude-code/setup" >&2
 fi
 
@@ -79,35 +82,36 @@ else
 fi
 echo "tfmux binary: $tfmux_bin"
 
-mkdir -p "$skills_dest"
-
 skill_names=(
   tmux-factory-claude-go
-  tmux-factory-claude-opus-go
   tmux-factory-codex-go
 )
 
-for skill_name in "${skill_names[@]}"; do
-  src="$skills_src/$skill_name"
-  dest="$skills_dest/$skill_name"
+for skills_dest in "${skill_dest_roots[@]}"; do
+  mkdir -p "$skills_dest"
 
-  if [[ ! -d "$src" ]]; then
-    echo "error: packaged skill missing: $src" >&2
-    exit 1
-  fi
+  for skill_name in "${skill_names[@]}"; do
+    src="$skills_src/$skill_name"
+    dest="$skills_dest/$skill_name"
 
-  if [[ -e "$dest" || -L "$dest" ]]; then
-    if [[ "$force" -eq 1 ]]; then
-      echo "warn: replacing existing skill: $dest" >&2
-      rm -rf "$dest"
-    else
-      echo "warn: skill already exists, skipping: $dest" >&2
-      continue
+    if [[ ! -d "$src" ]]; then
+      echo "error: packaged skill missing: $src" >&2
+      exit 1
     fi
-  fi
 
-  cp -R "$src" "$dest"
-  echo "installed skill: $dest"
+    if [[ -e "$dest" || -L "$dest" ]]; then
+      if [[ "$force" -eq 1 ]]; then
+        echo "warn: replacing existing skill: $dest" >&2
+        rm -rf "$dest"
+      else
+        echo "warn: skill already exists, skipping: $dest" >&2
+        continue
+      fi
+    fi
+
+    cp -R "$src" "$dest"
+    echo "installed skill: $dest"
+  done
 done
 
 cat <<'NEXT'
