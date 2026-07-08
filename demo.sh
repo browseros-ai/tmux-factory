@@ -63,7 +63,10 @@ launch_claude_worker() {
 send_claude_prompt() {
   local worker_num="$1"
   local target="worker$worker_num"
-  local send_command="${tfmux_env_prefix}tfmux send mediator --session $TFMUX_SESSION_NAME --text 'worker $worker_num: hi, ready'"
+  # Use the resolved absolute tfmux path, not a bare `tfmux`: this command runs in
+  # the worker pane, whose PATH comes from the tmux server and may predate the
+  # cargo bin dir (common right after a first install).
+  local send_command="${tfmux_env_prefix}$tfmux_cmd send mediator --session $tfmux_session_arg --text 'worker $worker_num: hi, ready'"
   local prompt="Say hi in one short line as worker $worker_num of this tmux software factory, then run: $send_command"
   tfmux send "$target" --session "$TFMUX_SESSION_NAME" --text "$prompt"
 }
