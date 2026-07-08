@@ -43,6 +43,11 @@ skill_dest_roots=(
   "$HOME/.codex/skills"
 )
 
+required_skill_names=(
+  tmux-factory-claude-go
+  tmux-factory-codex-go
+)
+
 script_dir=""
 script_path="${BASH_SOURCE[0]:-}"
 if [[ -n "$script_path" && -e "$script_path" ]]; then
@@ -106,6 +111,7 @@ install_skills() {
   local skill_paths=()
   local skill_path
   local skill_name
+  local required_skill_name
   local skills_dest
   local src
   local dest
@@ -114,6 +120,13 @@ install_skills() {
     echo "error: packaged skills directory not found: $skills_src" >&2
     exit 1
   fi
+
+  for required_skill_name in "${required_skill_names[@]}"; do
+    if [[ ! -d "$skills_src/$required_skill_name" ]]; then
+      echo "error: required packaged skill missing: $skills_src/$required_skill_name" >&2
+      exit 1
+    fi
+  done
 
   for skill_path in "$skills_src"/tmux-factory-*; do
     if [[ -d "$skill_path" ]]; then
@@ -164,12 +177,71 @@ cargo_tfmux_bin() {
   fi
 }
 
-cargo_install() {
-  if cargo +stable --version >/dev/null 2>&1; then
-    cargo +stable install "$@"
-  else
-    cargo install "$@"
+user_home_from_passwd() {
+  local user_name="${USER:-}"
+  local user_home
+
+  if [[ -z "$user_name" ]]; then
+    user_name="$(id -un 2>/dev/null || true)"
   fi
+  if [[ -z "$user_name" ]]; then
+    return 1
+  fi
+
+  if command -v getent >/dev/null 2>&1; then
+    user_home="$(getent passwd "$user_name" 2>/dev/null | awk -F: '{print $6; exit}' || true)"
+    if [[ -n "$user_home" ]]; then
+      echo "$user_home"
+      return 0
+    fi
+  fi
+
+  if command -v dscl >/dev/null 2>&1; then
+    user_home="$(dscl . -read "/Users/$user_name" NFSHomeDirectory 2>/dev/null | awk '{print $2; exit}' || true)"
+    if [[ -n "$user_home" ]]; then
+      echo "$user_home"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+rustup_home_dir() {
+  local user_home
+
+  if [[ -n "${RUSTUP_HOME:-}" && -d "$RUSTUP_HOME" ]]; then
+    echo "$RUSTUP_HOME"
+    return 0
+  fi
+
+  if [[ -d "$HOME/.rustup" ]]; then
+    echo "$HOME/.rustup"
+    return 0
+  fi
+
+  user_home="$(user_home_from_passwd || true)"
+  if [[ -n "$user_home" && -d "$user_home/.rustup" ]]; then
+    echo "$user_home/.rustup"
+    return 0
+  fi
+
+  return 1
+}
+
+cargo_install() {
+  local rustup_home
+
+  if command -v rustup >/dev/null 2>&1; then
+    rustup_home="$(rustup_home_dir || true)"
+    if [[ -n "$rustup_home" ]] \
+      && RUSTUP_HOME="$rustup_home" rustup run stable cargo --version >/dev/null 2>&1; then
+      RUSTUP_HOME="$rustup_home" rustup run stable cargo install "$@"
+      return
+    fi
+  fi
+
+  cargo install "$@"
 }
 
 asset_for_platform() {
@@ -212,15 +284,19 @@ install_release_binary() {
   local asset="$1"
   local install_dir="$HOME/.local/bin"
   local tfmux_bin="$install_dir/tfmux"
+  local tmp_tfmux_bin
   local url="$RELEASE_DOWNLOAD_URL/$asset"
 
   echo "Downloading $asset from latest GitHub Release..."
   mkdir -p "$install_dir"
-  if ! curl -fsSL "$url" -o "$tfmux_bin"; then
+  tmp_tfmux_bin="$(mktemp "$install_dir/.tfmux.XXXXXX")"
+  if ! curl -fsSL "$url" -o "$tmp_tfmux_bin"; then
+    rm -f "$tmp_tfmux_bin"
     echo "error: failed to download release asset: $url" >&2
     exit 1
   fi
-  chmod +x "$tfmux_bin"
+  chmod +x "$tmp_tfmux_bin"
+  mv "$tmp_tfmux_bin" "$tfmux_bin"
   echo "tfmux binary: $tfmux_bin"
 
   if ! path_has_dir "$install_dir"; then
