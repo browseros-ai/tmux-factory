@@ -42,17 +42,18 @@ Plan in one pane. Delegate. Get pinged.
 | macOS or Linux | everything | no Windows support |
 | `tmux` | everything | must be on `PATH`, or set `TFMUX_TMUX_BIN` |
 | Rust toolchain | building `tfmux` | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
-| Claude Code CLI | the skills, and the live demo | [claude.com/claude-code](https://claude.com/claude-code) |
-| Codex CLI | `/tmux-factory-codex-go` | optional |
-| `gh` | `codex-go` opening and merging PRs | optional |
+| Claude Code CLI | the live demo, and the `claude` skills | authenticated: run `claude` once and sign in. [claude.com/claude-code](https://claude.com/claude-code) |
+| Codex CLI | `/tmux-factory-codex-go` | authenticated |
+| `gh` | `/tmux-factory-codex-go` | authenticated; the codex launcher requires it |
 
-`tfmux` itself needs only tmux and Rust. The agent CLIs are what make it a
-factory; `demo.sh` falls back to plain-shell workers if none are installed.
+`tfmux` itself needs only tmux and Rust. `demo.sh` uses the `claude` CLI when it is
+on `PATH`, and falls back to plain-shell workers when it is not. The skills assume
+more than `tfmux` does — see [What the skills assume](#what-the-skills-assume).
 
 ## Quickstart
 
 ```bash
-git clone https://github.com/felarof99/tmux-factory && cd tmux-factory
+git clone https://github.com/browseros-ai/tmux-factory && cd tmux-factory
 ./install.sh
 ```
 
@@ -106,6 +107,43 @@ Then `git pull` and keep going. The other two skills:
 
 Fire several. They run in parallel, in separate worktrees, and each one pings you
 when it lands. Attach to any of them with `tfmux attach <tmux-session>` to watch.
+
+### What the skills assume
+
+The skills are packaged as they run on the author's machine, and they assume more
+than `tfmux` does. Each launcher preflights its dependencies and exits non-zero on
+the first one missing, so a gap surfaces immediately rather than mid-run.
+
+| Assumed on `PATH` | Used for | Skills |
+|---|---|---|
+| `git`, `tmux`, `tfmux`, `python3` | worktree, panes, delivery, path resolution | all three |
+| `wt` | creating the `feat/<slug>` worktree | all three |
+| `dotllm` | giving the worktree a `.llm/` scratch directory | all three |
+| `gh`, authenticated | opening and squash-merging the PR | `codex-go` |
+
+Two further assumptions are not checked by a `command -v` probe:
+
+- **Launch aliases.** At its default effort each launcher spawns a shell alias —
+  `claudex`, `claudeo`, `codexy` — through `$SHELL -ic`. Pass `--effort` below the
+  default to invoke `claude`/`codex` directly instead, or replace the command
+  outright with `SF_CLAUDEGO_CMD` / `SF_CODEXGO_CMD`.
+- **`/tmux-factory-codex-go` needs the `shadowfax` bundle**, which supplies the
+  `$sf-auto` loop in `~/.codex/skills/`. Without it codex receives the task but has
+  no loop to run.
+
+`wt`, `dotllm`, and `shadowfax` are not bundled with this repo. None of them are
+needed by `tfmux` itself — `bind`, `send`, `targets`, `attach`, and `unbind` never
+touch them.
+
+What a skill run does to your machine:
+
+- creates a git worktree **as a sibling of your repo** (`<repo>.feat-<slug>`) on a
+  new `feat/<slug>` branch
+- runs `dotllm init` inside that worktree
+- spawns a **detached tmux session** per run (`sf_<slug>_claude` / `sf_<slug>_codex`)
+- writes target records under `~/.tfmux/<date>/tfmux-<slug>/`
+- `/tmux-factory-codex-go` additionally opens a PR and **squash-merges it to `main`**
+  on your remote
 
 ## How It Works
 
