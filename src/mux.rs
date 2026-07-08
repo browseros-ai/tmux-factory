@@ -266,11 +266,12 @@ impl Mux for Tmux {
     ) -> Result<()> {
         let session = shell_quote(session);
         let nested_socket = socket.trim();
+        let bin = shell_quote(&self.bin.display().to_string());
         let command = if nested_socket.is_empty() {
-            format!("env -u TMUX tmux attach-session -t {session}")
+            format!("env -u TMUX {bin} attach-session -t {session}")
         } else {
             format!(
-                "env -u TMUX tmux -L {} attach-session -t {session}",
+                "env -u TMUX {bin} -L {} attach-session -t {session}",
                 shell_quote(nested_socket)
             )
         };
@@ -658,9 +659,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn attach_session_in_new_window_empty_socket_keeps_legacy_inner_command() {
+    fn attach_session_in_new_window_empty_socket_uses_resolved_inner_binary() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_recording_tmux(dir.path(), "");
+        let quoted_bin = shell_quote(&bin.display().to_string());
         let tmux = Tmux::new(bin, "", "default");
 
         tmux.attach_session_in_new_window("worker", "agent-worker", "")
@@ -673,7 +675,7 @@ mod tests {
                 "new-window",
                 "-n",
                 "agent-worker",
-                "env -u TMUX tmux attach-session -t worker",
+                &format!("env -u TMUX {quoted_bin} attach-session -t worker"),
             ]
         );
     }
@@ -683,6 +685,7 @@ mod tests {
     fn attach_session_in_new_window_socket_qualifies_inner_command_only() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_recording_tmux(dir.path(), "");
+        let quoted_bin = shell_quote(&bin.display().to_string());
         let tmux = Tmux::new(bin, "factory", "default");
 
         tmux.attach_session_in_new_window("worker", "agent-worker", "factory")
@@ -695,7 +698,7 @@ mod tests {
                 "new-window",
                 "-n",
                 "agent-worker",
-                "env -u TMUX tmux -L factory attach-session -t worker",
+                &format!("env -u TMUX {quoted_bin} -L factory attach-session -t worker"),
             ]
         );
     }
@@ -705,6 +708,7 @@ mod tests {
     fn attach_session_empty_socket_keeps_legacy_command_with_custom_main_socket() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_recording_tmux(dir.path(), "");
+        let quoted_bin = shell_quote(&bin.display().to_string());
         let tmux = Tmux::new(bin, "", "main");
 
         tmux.attach_session_in_new_window("worker", "agent-worker", "")
@@ -717,7 +721,7 @@ mod tests {
                 "new-window",
                 "-n",
                 "agent-worker",
-                "env -u TMUX tmux attach-session -t worker",
+                &format!("env -u TMUX {quoted_bin} attach-session -t worker"),
             ]
         );
     }
@@ -726,7 +730,8 @@ mod tests {
     #[test]
     fn attach_session_quotes_nested_session_argument() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = write_recording_tmux(dir.path(), "");
+        let bin = write_recording_tmux_named(dir.path(), "fake tmux's bin", "");
+        let quoted_bin = shell_quote(&bin.display().to_string());
         let tmux = Tmux::new(bin, "", "default");
 
         tmux.attach_session_in_new_window("work session's $main", "agent", "")
@@ -739,7 +744,7 @@ mod tests {
                 "new-window",
                 "-n",
                 "agent",
-                "env -u TMUX tmux attach-session -t 'work session'\\''s $main'",
+                &format!("env -u TMUX {quoted_bin} attach-session -t 'work session'\\''s $main'"),
             ]
         );
     }
@@ -808,13 +813,18 @@ mod tests {
 
     #[cfg(unix)]
     fn write_recording_tmux(dir: &Path, response: &str) -> PathBuf {
+        write_recording_tmux_named(dir, "faketmux-record", response)
+    }
+
+    #[cfg(unix)]
+    fn write_recording_tmux_named(dir: &Path, name: &str, response: &str) -> PathBuf {
         let argv = dir.join("argv.txt");
         let stdin = dir.join("stdin.txt");
         let resp = dir.join("response.txt");
         fs::write(&resp, response).unwrap();
         let script =
             format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {argv:?}\ncat > {stdin:?}\ncat {resp:?}\n");
-        write_script(dir.join("faketmux-record"), &script)
+        write_script(dir.join(name), &script)
     }
 
     #[cfg(unix)]
