@@ -21,6 +21,7 @@ MAIN_TARBALL_URL="https://codeload.github.com/browseros-ai/tmux-factory/tar.gz/r
 
 force=0
 next_command="tfmux --help"
+install_tmp_dir=""
 for arg in "$@"; do
   case "$arg" in
     --force)
@@ -67,6 +68,12 @@ require_command() {
   if ! command -v "$name" >/dev/null 2>&1; then
     echo "$message" >&2
     return 1
+  fi
+}
+
+cleanup_tmp_dir() {
+  if [[ -n "${install_tmp_dir:-}" ]]; then
+    rm -rf "$install_tmp_dir"
   fi
 }
 
@@ -378,10 +385,8 @@ run_curl_mode() {
   fi
 
   tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/tfmux-install.XXXXXX")"
-  cleanup() {
-    rm -rf "$tmp_dir"
-  }
-  trap cleanup EXIT
+  install_tmp_dir="$tmp_dir"
+  trap cleanup_tmp_dir EXIT
 
   downloaded_skills="$(download_main_skills "$tmp_dir")"
   install_skills "$downloaded_skills"
