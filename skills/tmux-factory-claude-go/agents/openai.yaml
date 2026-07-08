@@ -1,0 +1,4 @@
+interface:
+  display_name: "tmux-factory-claude-go"
+  short_description: "Fire-and-get-pinged Claude Code session over tfmux"
+  default_prompt: "Use $tmux-factory-claude-go to launch a Claude Code session for this task in its own worktree and ping me when it finishes."
