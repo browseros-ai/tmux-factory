@@ -681,7 +681,7 @@ fn bind_real_binary_uses_socket_flag_for_pane_resolution() {
 
 #[cfg(unix)]
 #[test]
-fn attach_real_binary_uses_custom_main_socket_for_probe_and_legacy_inner_attach() {
+fn attach_real_binary_uses_custom_main_socket_for_probe_and_resolved_inner_attach() {
     let dir = tempfile::tempdir().unwrap();
     let fake_tmux = write_multi_call_recording_tmux(dir.path());
 
@@ -704,8 +704,7 @@ fn attach_real_binary_uses_custom_main_socket_for_probe_and_legacy_inner_attach(
     );
 
     let calls = std::fs::read_to_string(dir.path().join("argv.txt")).unwrap();
-    assert_eq!(
-        calls,
+    let expected = format!(
         concat!(
             "-L\n",
             "main\n",
@@ -716,10 +715,12 @@ fn attach_real_binary_uses_custom_main_socket_for_probe_and_legacy_inner_attach(
             "new-window\n",
             "-n\n",
             "worker\n",
-            "env -u TMUX tmux attach-session -t worker\n",
+            "env -u TMUX {} attach-session -t worker\n",
             "--\n",
-        )
+        ),
+        fake_tmux.display()
     );
+    assert_eq!(calls, expected);
 }
 
 #[test]

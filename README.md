@@ -257,7 +257,7 @@ The date directory is the local calendar date the session was created.
 |---|---|
 | `TFMUX_SESSION` | Default tfmux session for stateful commands. |
 | `TFMUX_HOME` | State root (default `~/.tfmux`). |
-| `TFMUX_TMUX_BIN` | tmux binary to use (default: `tmux` on `PATH`). |
+| `TFMUX_TMUX_BIN` | tmux binary to use (default: `tmux` on `PATH`, then well-known-location fallback). |
 | `TFMUX_SOCKET` | tmux socket for `bind` and `attach`, below the `--socket` flag. |
 | `TFMUX_MAIN_SOCKET` | Socket name treated as the default when derived from `TMUX`. |
 
@@ -282,7 +282,8 @@ the target so later `send`/`targets` calls reach the right server.
 - **Demo workers sit idle.** The `claude` CLI is installed but not authenticated.
   Run `claude` once, sign in, then re-run `./demo.sh`. With no agent CLI at all, the
   demo falls back to plain-shell workers and still pings.
-- **tmux is somewhere unusual.** `export TFMUX_TMUX_BIN=/path/to/tmux`.
+- **tmux is off PATH.** tfmux probes common locations automatically; for unusual
+  installs, set `TFMUX_TMUX_BIN=/full/path/to/tmux`.
 
 </details>
 

@@ -8,6 +8,16 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+const WELL_KNOWN_TMUX_BINS: &[&str] = &[
+    "/opt/homebrew/bin/tmux",
+    "/usr/local/bin/tmux",
+    "/usr/bin/tmux",
+    "/bin/tmux",
+    "/opt/local/bin/tmux",
+    "/home/linuxbrew/.linuxbrew/bin/tmux",
+    "/snap/bin/tmux",
+];
+
 /// Canonical pane information resolved from a tmux target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneRef {
@@ -67,17 +77,19 @@ impl Tmux {
         }
     }
 
-    /// Resolve the tmux binary from `TFMUX_TMUX_BIN` (else `tmux`) on `PATH`.
+    /// Resolve the tmux binary from env, PATH, or common install locations.
     pub fn from_env(socket: &str) -> Result<Self> {
-        let name = std::env::var("TFMUX_TMUX_BIN")
+        let explicit = std::env::var("TFMUX_TMUX_BIN")
             .ok()
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "tmux".to_string());
+            .filter(|s| !s.is_empty());
         let main_socket = std::env::var("TFMUX_MAIN_SOCKET").unwrap_or_default();
-        let bin = which::which(&name).map_err(|e| {
-            anyhow!("tmux binary \"{name}\" not found; install tmux or set TFMUX_TMUX_BIN: {e}")
-        })?;
+        let bin = resolve_tmux_binary(
+            explicit.as_deref(),
+            || which::which("tmux").ok(),
+            WELL_KNOWN_TMUX_BINS,
+            |candidate| which::which(candidate).ok(),
+        )?;
         Ok(Self::new(bin, socket, &main_socket))
     }
 
@@ -137,6 +149,49 @@ impl Tmux {
         }
         bail!("tmux {sub} failed: {detail}");
     }
+}
+
+fn resolve_tmux_binary<P, C, S>(
+    explicit: Option<&str>,
+    mut path_lookup: P,
+    probes: &[S],
+    mut candidate_lookup: C,
+) -> Result<PathBuf>
+where
+    P: FnMut() -> Option<PathBuf>,
+    C: FnMut(&str) -> Option<PathBuf>,
+    S: AsRef<str>,
+{
+    if let Some(bin) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return candidate_lookup(bin).ok_or_else(|| {
+            anyhow!(
+                "TFMUX_TMUX_BIN={bin:?} is set, but it was not found or is not executable; \
+                 add tmux's directory to PATH or set TFMUX_TMUX_BIN=/full/path/to/tmux"
+            )
+        });
+    }
+
+    if let Some(bin) = path_lookup() {
+        return Ok(bin);
+    }
+
+    for candidate in probes {
+        if let Some(bin) = candidate_lookup(candidate.as_ref()) {
+            return Ok(bin);
+        }
+    }
+
+    let locations = probes
+        .iter()
+        .map(AsRef::as_ref)
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "tmux was not found on PATH nor in the well-known locations ({locations}). \
+         Install tmux with `brew install tmux` on macOS or `sudo apt install tmux` on \
+         Debian/Ubuntu. Then add tmux's directory to PATH, or set \
+         TFMUX_TMUX_BIN=/full/path/to/tmux."
+    );
 }
 
 fn resolve_socket(socket: &str, main_socket: &str) -> String {
@@ -211,11 +266,12 @@ impl Mux for Tmux {
     ) -> Result<()> {
         let session = shell_quote(session);
         let nested_socket = socket.trim();
+        let bin = shell_quote(&self.bin.display().to_string());
         let command = if nested_socket.is_empty() {
-            format!("env -u TMUX tmux attach-session -t {session}")
+            format!("env -u TMUX {bin} attach-session -t {session}")
         } else {
             format!(
-                "env -u TMUX tmux -L {} attach-session -t {session}",
+                "env -u TMUX {bin} -L {} attach-session -t {session}",
                 shell_quote(nested_socket)
             )
         };
@@ -297,6 +353,145 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("malformed"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_tmux_binary_explicit_override_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let explicit = write_script(dir.path().join("explicit-tmux"), "#!/bin/sh\n");
+        let path_hit = write_script(dir.path().join("path-tmux"), "#!/bin/sh\n");
+        let probe_hit = write_script(dir.path().join("probe-tmux"), "#!/bin/sh\n");
+        let probes = [probe_hit.to_string_lossy().into_owned()];
+        let mut path_lookup_called = false;
+        let mut looked_up = Vec::new();
+
+        let resolved = resolve_tmux_binary(
+            Some(explicit.to_str().unwrap()),
+            || {
+                path_lookup_called = true;
+                Some(path_hit.clone())
+            },
+            &probes,
+            |candidate| {
+                looked_up.push(candidate.to_string());
+                if candidate == explicit.to_str().unwrap() {
+                    Some(explicit.clone())
+                } else if candidate == probe_hit.to_str().unwrap() {
+                    Some(probe_hit.clone())
+                } else {
+                    None
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved, explicit);
+        assert!(!path_lookup_called);
+        assert_eq!(looked_up, vec![explicit.to_string_lossy()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_tmux_binary_bogus_explicit_errors_without_probe() {
+        let bogus = "/bogus/tmux";
+        let probes = ["/opt/homebrew/bin/tmux".to_string()];
+        let mut path_lookup_called = false;
+        let mut looked_up = Vec::new();
+
+        let err = resolve_tmux_binary(
+            Some(bogus),
+            || {
+                path_lookup_called = true;
+                None
+            },
+            &probes,
+            |candidate| {
+                looked_up.push(candidate.to_string());
+                None
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("TFMUX_TMUX_BIN"), "got: {err}");
+        assert!(err.contains(bogus), "got: {err}");
+        assert!(!path_lookup_called);
+        assert_eq!(looked_up, vec![bogus]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_tmux_binary_path_hit_preferred_over_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_hit = write_script(dir.path().join("path-tmux"), "#!/bin/sh\n");
+        let probe_hit = write_script(dir.path().join("probe-tmux"), "#!/bin/sh\n");
+        let probes = [probe_hit.to_string_lossy().into_owned()];
+        let mut probe_lookup_called = false;
+
+        let resolved = resolve_tmux_binary(
+            None,
+            || Some(path_hit.clone()),
+            &probes,
+            |_| {
+                probe_lookup_called = true;
+                Some(probe_hit.clone())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved, path_hit);
+        assert!(!probe_lookup_called);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_tmux_binary_probe_hit_when_path_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe_hit = write_script(dir.path().join("probe-tmux"), "#!/bin/sh\n");
+        let missing = dir.path().join("missing-tmux");
+        let probes = [
+            missing.to_string_lossy().into_owned(),
+            probe_hit.to_string_lossy().into_owned(),
+        ];
+
+        let resolved = resolve_tmux_binary(
+            None,
+            || None,
+            &probes,
+            |candidate| {
+                if candidate == probe_hit.to_str().unwrap() {
+                    Some(probe_hit.clone())
+                } else {
+                    None
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved, probe_hit);
+    }
+
+    #[test]
+    fn resolve_tmux_binary_full_miss_error_contains_remedies() {
+        let err = resolve_tmux_binary(None, || None, WELL_KNOWN_TMUX_BINS, |_| None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("tmux was not found on PATH nor in the well-known locations"),
+            "got: {err}"
+        );
+        for location in WELL_KNOWN_TMUX_BINS {
+            assert!(err.contains(location), "missing {location}: {err}");
+        }
+        assert!(err.contains("brew install tmux"), "got: {err}");
+        assert!(err.contains("sudo apt install tmux"), "got: {err}");
+        assert!(err.contains("add tmux's directory to PATH"), "got: {err}");
+        assert!(
+            err.contains("TFMUX_TMUX_BIN=/full/path/to/tmux"),
+            "got: {err}"
+        );
     }
 
     // ---- Tmux::resolve_pane (subprocess via a fake tmux binary) ----
@@ -464,9 +659,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn attach_session_in_new_window_empty_socket_keeps_legacy_inner_command() {
+    fn attach_session_in_new_window_empty_socket_uses_resolved_inner_binary() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_recording_tmux(dir.path(), "");
+        let quoted_bin = shell_quote(&bin.display().to_string());
         let tmux = Tmux::new(bin, "", "default");
 
         tmux.attach_session_in_new_window("worker", "agent-worker", "")
@@ -479,7 +675,7 @@ mod tests {
                 "new-window",
                 "-n",
                 "agent-worker",
-                "env -u TMUX tmux attach-session -t worker",
+                &format!("env -u TMUX {quoted_bin} attach-session -t worker"),
             ]
         );
     }
@@ -489,6 +685,7 @@ mod tests {
     fn attach_session_in_new_window_socket_qualifies_inner_command_only() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_recording_tmux(dir.path(), "");
+        let quoted_bin = shell_quote(&bin.display().to_string());
         let tmux = Tmux::new(bin, "factory", "default");
 
         tmux.attach_session_in_new_window("worker", "agent-worker", "factory")
@@ -501,7 +698,7 @@ mod tests {
                 "new-window",
                 "-n",
                 "agent-worker",
-                "env -u TMUX tmux -L factory attach-session -t worker",
+                &format!("env -u TMUX {quoted_bin} -L factory attach-session -t worker"),
             ]
         );
     }
@@ -511,6 +708,7 @@ mod tests {
     fn attach_session_empty_socket_keeps_legacy_command_with_custom_main_socket() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_recording_tmux(dir.path(), "");
+        let quoted_bin = shell_quote(&bin.display().to_string());
         let tmux = Tmux::new(bin, "", "main");
 
         tmux.attach_session_in_new_window("worker", "agent-worker", "")
@@ -523,7 +721,7 @@ mod tests {
                 "new-window",
                 "-n",
                 "agent-worker",
-                "env -u TMUX tmux attach-session -t worker",
+                &format!("env -u TMUX {quoted_bin} attach-session -t worker"),
             ]
         );
     }
@@ -532,7 +730,8 @@ mod tests {
     #[test]
     fn attach_session_quotes_nested_session_argument() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = write_recording_tmux(dir.path(), "");
+        let bin = write_recording_tmux_named(dir.path(), "fake tmux's bin", "");
+        let quoted_bin = shell_quote(&bin.display().to_string());
         let tmux = Tmux::new(bin, "", "default");
 
         tmux.attach_session_in_new_window("work session's $main", "agent", "")
@@ -545,7 +744,7 @@ mod tests {
                 "new-window",
                 "-n",
                 "agent",
-                "env -u TMUX tmux attach-session -t 'work session'\\''s $main'",
+                &format!("env -u TMUX {quoted_bin} attach-session -t 'work session'\\''s $main'"),
             ]
         );
     }
@@ -614,13 +813,18 @@ mod tests {
 
     #[cfg(unix)]
     fn write_recording_tmux(dir: &Path, response: &str) -> PathBuf {
+        write_recording_tmux_named(dir, "faketmux-record", response)
+    }
+
+    #[cfg(unix)]
+    fn write_recording_tmux_named(dir: &Path, name: &str, response: &str) -> PathBuf {
         let argv = dir.join("argv.txt");
         let stdin = dir.join("stdin.txt");
         let resp = dir.join("response.txt");
         fs::write(&resp, response).unwrap();
         let script =
             format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {argv:?}\ncat > {stdin:?}\ncat {resp:?}\n");
-        write_script(dir.join("faketmux-record"), &script)
+        write_script(dir.join(name), &script)
     }
 
     #[cfg(unix)]
