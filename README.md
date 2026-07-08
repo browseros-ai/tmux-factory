@@ -4,8 +4,6 @@
 panes to stable names, send work into them, and let agents report back by
 sending text to the mediator pane.
 
-Inspired by `riff3`; it shares no state, paths, or commands with it.
-
 ## What tfmux Does
 
 - Names tmux panes as targets such as `mediator`, `agent1`, or `agent2`.
