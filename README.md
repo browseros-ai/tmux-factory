@@ -1,103 +1,64 @@
 # tmux-factory
 
-A software factory built with tmux: an orchestrator pane that fires off real
-coding-agent sessions into isolated git worktrees, and gets pinged back when
-they are done.
+A software factory built with tmux: one orchestrator pane fans real coding-agent
+sessions out into isolated git worktrees, and gets pinged back when each lands.
 
-![tmux-factory demo](assets/demo.gif)
+## The dream
 
-## What This Is
+You sit in one Claude session — **Fable**, the orchestrator — inside tmux. You
+type one line:
 
-Two pieces:
+```text
+/tmux-factory-codex-go implement dark mode
+```
 
-- **`tfmux`** — a small synchronous Rust CLI that names tmux panes, delivers
-  work into them (buffer, paste, Enter, then verifies the payload was
-  submitted), and lets any pane send text back to the mediator pane.
-- **Drop-in Claude Code skills** — `/tmux-factory-claude-go`,
-  `/tmux-factory-claude-opus-go`, `/tmux-factory-codex-go`. They turn `tfmux`
-  into a fire-and-forget factory: each one spins up a worktree, spawns a
-  detached agent session, delivers the task, and arms a ping back to your pane.
+and get back to what you were doing. A codex worker spins up in its own git
+worktree: designs, implements, reviews, opens a PR, squash-merges to main.
+Minutes later a line lands in *your* pane:
 
-No daemon. No polling. No inbox, transcript, or dashboard. State is a few JSON
-files under `~/.tfmux`.
+```text
+dark-mode merged: https://github.com/you/repo/pull/42
+```
 
-## Why
+Fire three at once; each reports back on its own. Your session stays clean — the
+orchestrator plans, the workers burn the tokens.
 
-The orchestrator pattern everyone is talking about: a planner delegates to
-workers, and most tokens bill at the cheaper worker rate.
+![The orchestrator pattern](assets/orchestrator.png)
 
-tmux-factory runs that pattern on your laptop, with one difference — the workers
-are not API calls. They are **full Claude Code and codex sessions**, each in its
-own tmux pane and its own git worktree, on its own branch. You can attach to any
-of them and watch the agent work. When a worker finishes, it does not write to a
-queue you have to poll: it sends a one-line status **into your pane**, through
-`tfmux`. You stay idle and catch it.
+## Install
 
-Plan in one pane. Delegate. Get pinged.
+macOS and Linux. Three steps.
 
-## Prerequisites
+**1. Install tmux.**
 
-| Requirement | Needed for | Notes |
-|---|---|---|
-| macOS or Linux | everything | no Windows support |
-| `tmux` | everything | must be on `PATH`, or set `TFMUX_TMUX_BIN` |
-| Rust toolchain | building `tfmux` | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
-| Claude Code CLI | the live demo, and the `claude` skills | authenticated: run `claude` once and sign in. [claude.com/claude-code](https://claude.com/claude-code) |
-| Codex CLI | `/tmux-factory-codex-go` | authenticated |
-| `gh` | `/tmux-factory-codex-go` | authenticated; the codex launcher requires it |
+```bash
+brew install tmux         # macOS
+sudo apt install tmux     # Linux (Debian/Ubuntu)
+```
 
-`tfmux` itself needs only tmux and Rust. `demo.sh` uses the `claude` CLI when it is
-on `PATH`, and falls back to plain-shell workers when it is not. The skills assume
-more than `tfmux` does — see [What the skills assume](#what-the-skills-assume).
-
-## Quickstart
+**2. Install tfmux and the skills.**
 
 ```bash
 git clone https://github.com/browseros-ai/tmux-factory && cd tmux-factory
 ./install.sh
 ```
 
-`install.sh` checks tmux and cargo, warns if the `claude`/`codex` CLIs are
-missing, runs `cargo install --path .`, and copies the skills into
-`~/.claude/skills/` (pass `--force` to overwrite existing copies).
+`install.sh` cargo-installs the `tfmux` binary and copies the three skills into
+`~/.claude/skills/`. No Rust yet? Install it first, then rerun:
+`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 
-Then, **from inside tmux**, the 60-second version:
-
-```bash
-./demo.sh
-```
-
-It spawns a detached tmux session `tfmux-demo` with one mediator and three
-worker panes, bound through `tfmux` under the session `demo-hello`. If the
-`claude` CLI is installed, the workers are live Claude sessions: each says hi and
-sends `worker N: hi, ready` back to the mediator pane. Watch three agents report
-in without a single poll.
-
-Tear it down:
+**3. Start Claude inside tmux and fire a task.**
 
 ```bash
-tmux kill-session -t tfmux-demo
+tmux      # open a tmux session
+claude    # start Claude Code in any git repo
 ```
-
-### The Real Thing
-
-Open Claude Code in any git repo, inside tmux, and type:
 
 ```text
-/tmux-factory-codex-go add a --json flag to the targets command
+/tmux-factory-codex-go <your feature>
 ```
 
-Your pane is bound as the tfmux mediator. A worktree and a detached codex
-session are created, the task is delivered and verified, and control returns to
-you immediately. codex runs the full loop — design, implement, review, open a
-PR, squash-merge to main — and then pings you. Minutes later, a line lands in
-your pane, as if someone typed it there:
-
-```text
-merged: add --json flag to targets (PR #42, squash-merged to main)
-```
-
-Then `git pull` and keep going. The other two skills:
+## The skills
 
 | Skill | What it does |
 |---|---|
@@ -105,14 +66,66 @@ Then `git pull` and keep going. The other two skills:
 | `/tmux-factory-claude-opus-go <task>` | The same, on Opus at max effort. |
 | `/tmux-factory-codex-go <feature>` | Full loop: design, implement, review, open PR, squash-merge to main, then ping. |
 
-Fire several. They run in parallel, in separate worktrees, and each one pings you
-when it lands. Attach to any of them with `tfmux attach <tmux-session>` to watch.
+The first time you fire one, your pane is bound as the tfmux mediator and the
+worker runs detached — you keep working. When it lands, a line arrives in your
+pane as if someone typed it there:
 
-### What the skills assume
+```text
+merged: add --json flag to targets (PR #42, squash-merged to main)
+```
+
+Then `git pull` and keep going. `/tmux-factory-codex-go` needs `gh` installed and
+authenticated.
+
+**See it run first.** From inside tmux, `./demo.sh` spins up three workers that
+report in without a single poll (tear down with `tmux kill-session -t tfmux-demo`).
+
+![tmux-factory demo](assets/demo.gif)
+
+## Under the hood
+
+<details>
+<summary><b>How it works</b></summary>
+
+Two pieces:
+
+- **`tfmux`** — a small synchronous Rust CLI that names tmux panes, delivers work
+  into them (buffer, paste, Enter, then verifies the payload landed), and lets any
+  pane send a line back to the mediator pane.
+- **The skills** — `/tmux-factory-claude-go`, `/tmux-factory-claude-opus-go`,
+  `/tmux-factory-codex-go`. Each spins up a worktree, spawns a detached agent
+  session, delivers the task, and arms a ping back to your pane.
+
+No daemon, no polling, no inbox or dashboard. State is a few JSON files under
+`~/.tfmux`.
+
+```text
+                     your tmux window
+        +---------------------------------------+
+        |  mediator pane  (Claude, planning)    |
+        +---------------------------------------+
+             |                            ^
+  task in    |                            |  "merged" / "blocked"
+             v                            |
+        +---------------------------------------+
+        |  detached sessions, one per worker    |
+        |  worker1  codex   feat-a              |
+        |  worker2  claude  feat-b              |
+        +---------------------------------------+
+```
+
+Each worker is bound to a stable name, so the mediator addresses it by name, not
+by a pane id that moves. The ping back is the same mechanism in reverse — a worker
+runs `tfmux send mediator --text "..."`.
+
+</details>
+
+<details>
+<summary><b>What the skills assume</b></summary>
 
 The skills are packaged as they run on the author's machine, and they assume more
 than `tfmux` does. Each launcher preflights its dependencies and exits non-zero on
-the first one missing, so a gap surfaces immediately rather than mid-run.
+the first one missing.
 
 | Assumed on `PATH` | Used for | Skills |
 |---|---|---|
@@ -121,64 +134,36 @@ the first one missing, so a gap surfaces immediately rather than mid-run.
 | `dotllm` | giving the worktree a `.llm/` scratch directory | all three |
 | `gh`, authenticated | opening and squash-merging the PR | `codex-go` |
 
-Two further assumptions are not checked by a `command -v` probe:
+Two assumptions are not probed by `command -v`:
 
 - **Launch aliases.** At its default effort each launcher spawns a shell alias —
   `claudex`, `claudeo`, `codexy` — through `$SHELL -ic`. Pass `--effort` below the
-  default to invoke `claude`/`codex` directly instead, or replace the command
-  outright with `SF_CLAUDEGO_CMD` / `SF_CODEXGO_CMD`.
-- **`/tmux-factory-codex-go` needs the `shadowfax` bundle**, which supplies the
-  `$sf-auto` loop in `~/.codex/skills/`. Without it codex receives the task but has
-  no loop to run.
+  default to invoke `claude`/`codex` directly, or override with `SF_CLAUDEGO_CMD` /
+  `SF_CODEXGO_CMD`.
+- **`codex-go` needs the `shadowfax` bundle**, which supplies the `$sf-auto` loop
+  in `~/.codex/skills/`. Without it codex gets the task but has no loop to run.
 
-`wt`, `dotllm`, and `shadowfax` are not bundled with this repo. None of them are
-needed by `tfmux` itself — `bind`, `send`, `targets`, `attach`, and `unbind` never
-touch them.
+`wt`, `dotllm`, and `shadowfax` are not bundled here, and `tfmux` itself never
+touches them.
 
-What a skill run does to your machine:
+**What a skill run does to your machine:**
 
 - creates a git worktree **as a sibling of your repo** (`<repo>.feat-<slug>`) on a
   new `feat/<slug>` branch
-- runs `dotllm init` inside that worktree
+- runs `dotllm init` inside it
 - spawns a **detached tmux session** per run (`sf_<slug>_claude` / `sf_<slug>_codex`)
 - writes target records under `~/.tfmux/<date>/tfmux-<slug>/`
-- `/tmux-factory-codex-go` additionally opens a PR and **squash-merges it to `main`**
-  on your remote
+- `codex-go` additionally opens a PR and **squash-merges it to `main`** on your remote
 
-## How It Works
+</details>
 
-```text
-                        your tmux window
-          +-------------------------------------------+
-          |  mediator pane                            |
-          |  Claude Code, planning and delegating     |
-          +-------------------------------------------+
-                 |                            ^
-   tfmux send    |                            |   tfmux send mediator
-   (task in)     |                            |   ("merged" / "blocked")
-                 v                            |
-          +-------------------------------------------+
-          |  detached tmux sessions, one per worker   |
-          |                                           |
-          |  worker1  claude  ../wt/feat-a   feat-a   |
-          |  worker2  codex   ../wt/feat-b   feat-b   |
-          |  worker3  claude  ../wt/fix-c    fix-c    |
-          +-------------------------------------------+
-```
-
-Each worker is bound to a stable name, so the mediator addresses it by name
-rather than by a pane id that moves. Delivery goes through a named tmux buffer,
-paste, Enter, and a scrollback check; if a Claude/codex pasted-content marker is
-still visible, `tfmux` sends one more Enter and checks again. The ping back is
-the same mechanism in reverse — a worker simply runs
-`tfmux send mediator --text "..."`.
-
-## tfmux Command Reference
+<details>
+<summary><b>tfmux command reference</b></summary>
 
 Run binding commands from inside tmux. On failure, `tfmux` prints
 `error: <message>` to stderr and exits 1.
 
-### bind
+**bind** — bind a pane to a stable name.
 
 ```bash
 tfmux bind <NAME> (--here | --tmux <TARGET>) [--role mediator|agent]
@@ -186,36 +171,21 @@ tfmux bind <NAME> (--here | --tmux <TARGET>) [--role mediator|agent]
                   [--socket NAME] [--json]
 ```
 
-Bind a pane to a stable name. Use exactly one pane source: `--here` reads
-`TMUX_PANE` and binds the current pane; `--tmux <TARGET>` resolves any tmux
-target string such as `%5` or `demo:1.0`. `--role` defaults to `agent`, `--kind`
-to `generic`; both are stored as metadata. `bind` creates the tfmux session on
-first use.
+Exactly one pane source: `--here` binds the current pane (reads `TMUX_PANE`);
+`--tmux <TARGET>` resolves any tmux target like `%5` or `demo:1.0`. `--role`
+defaults to `agent`, `--kind` to `generic`. Creates the tfmux session on first use.
 
-```bash
-tfmux bind mediator --here --role mediator
-tfmux bind agent1 --tmux %5 --role agent --kind claude
-```
-
-### send
+**send** — deliver a payload to a bound pane.
 
 ```bash
 tfmux send <NAME> (--text <TEXT> | --file <FILE> | -) [--session NAME]
 ```
 
-Deliver a payload to a bound pane. Use exactly one input source; empty payloads
-fail. Before sending, `tfmux` re-resolves the stored pane id and checks the pane
-metadata still matches the binding — if the pane is gone or changed, `send` fails
-and tells you to rebind.
+Exactly one input source; empty payloads fail. Before sending, `tfmux` re-resolves
+the stored pane id and checks its metadata still matches — if the pane is gone or
+changed, `send` fails and tells you to rebind.
 
-```bash
-tfmux send agent1 --text "Investigate the flaky test in store.rs"
-tfmux send agent1 --file plan.md
-echo "build and report back" | tfmux send agent1 -
-tfmux send mediator --text "agent1 done"
-```
-
-### targets
+**targets** — list bound panes and their liveness.
 
 ```bash
 tfmux targets [--session NAME] [--json]
@@ -227,41 +197,40 @@ agent1     agent    claude   %5     demo:1.0       live
 mediator   mediator generic  %3     demo:0.0       live
 ```
 
-`live` means the pane id and stored tmux metadata still match. `stale` means the
-pane id resolves but its session/window/pane metadata changed. `dead` means the
-pane no longer resolves.
+`live` = pane id and stored metadata match; `stale` = pane resolves but its
+session/window/pane metadata changed; `dead` = pane no longer resolves.
 
-### attach
+**attach** — open a detached worker in a new window.
 
 ```bash
 tfmux attach <TMUX_SESSION> [--window-name NAME] [--socket NAME]
 ```
 
-Run from inside tmux. Checks `tmux has-session`, then opens a new window running
-`env -u TMUX tmux attach-session -t <TMUX_SESSION>`, so you can watch a detached
-worker. `--window-name` defaults to the session name. `attach` is independent of
-factory state: it reads no `TFMUX_SESSION`, no marker file, no `~/.tfmux`.
+Run from inside tmux. Opens a new window running
+`env -u TMUX tmux attach-session -t <TMUX_SESSION>`, so you can watch a worker.
+Reads no factory state.
 
-### unbind
+**unbind** — remove a target record from the selected session.
 
 ```bash
 tfmux unbind <NAME> [--session NAME] [--json]
 ```
 
-Removes the target record from the selected session.
+</details>
 
-## State
+<details>
+<summary><b>State and environment</b></summary>
 
 A tfmux session groups the targets for one factory. There is no global "current
-session" file — session identity travels with the pane. Stateful commands
-(`bind`, `send`, `targets`, `unbind`) resolve it in this order:
+session" — identity travels with the pane. Stateful commands (`bind`, `send`,
+`targets`, `unbind`) resolve it in order:
 
 1. `--session NAME`
 2. `TFMUX_SESSION`
 3. First line of `.llm/tfmux-session` in the current directory
 
 Target and session names must be single path-safe tokens: no spaces, slashes,
-backslashes, tabs, or newlines. State lives under `$TFMUX_HOME`, else `~/.tfmux`,
+backslashes, tabs, or newlines. State lives under `$TFMUX_HOME` (else `~/.tfmux`),
 and every write is atomic:
 
 ```text
@@ -281,36 +250,30 @@ The date directory is the local calendar date the session was created.
 | `TFMUX_SOCKET` | tmux socket for `bind` and `attach`, below the `--socket` flag. |
 | `TFMUX_MAIN_SOCKET` | Socket name treated as the default when derived from `TMUX`. |
 
-Sockets rarely need attention. `bind --here` and `attach` derive the socket from
-the `TMUX` environment variable; `--socket` or `TFMUX_SOCKET` override it, and the
-chosen socket is stored on the target so later `send`/`targets` calls reach the
-right server.
+Sockets rarely need attention: `bind --here` and `attach` derive the socket from
+`TMUX`; `--socket` or `TFMUX_SOCKET` override it, and the chosen socket is stored on
+the target so later `send`/`targets` calls reach the right server.
 
-## Troubleshooting
+</details>
 
-**"attach requires TMUX" / "--here requires TMUX and TMUX_PANE".** These
-commands must run inside tmux. Start a tmux session first, or bind by explicit
-target with `--tmux %5`.
+<details>
+<summary><b>Troubleshooting</b></summary>
 
-**A worker pane died, and `send` fails.** Run `tfmux targets` — the pane will
-show `dead` or `stale`. Rebind it: `tfmux bind agent1 --tmux <new-target>`.
-Bindings are pane ids, not promises.
+- **"attach requires TMUX" / "--here requires TMUX and TMUX_PANE".** Run inside
+  tmux, or bind by explicit target with `--tmux %5`.
+- **A worker pane died and `send` fails.** Run `tfmux targets` — it shows `dead` or
+  `stale`. Rebind: `tfmux bind agent1 --tmux <new-target>`.
+- **"no tfmux session selected".** Pass `--session NAME`, export `TFMUX_SESSION`, or
+  put the name on the first line of `.llm/tfmux-session`. Workers need the *same*
+  session context as the mediator, or their ping has nowhere to land.
+- **The `/tmux-factory-*` skills do not show up.** Restart Claude Code — skills are
+  read at startup, and `install.sh` copies them in after yours is already running.
+- **Demo workers sit idle.** The `claude` CLI is installed but not authenticated.
+  Run `claude` once, sign in, then re-run `./demo.sh`. With no agent CLI at all, the
+  demo falls back to plain-shell workers and still pings.
+- **tmux is somewhere unusual.** `export TFMUX_TMUX_BIN=/path/to/tmux`.
 
-**"no tfmux session selected".** The command found no session context. Pass
-`--session NAME`, export `TFMUX_SESSION`, or drop the name on the first line of
-`.llm/tfmux-session` in the working directory. Workers need the *same* session
-context as the mediator, or their ping has nowhere to land.
-
-**The `/tmux-factory-*` skills do not show up.** Restart Claude Code. Skills are
-read at startup, and `install.sh` copies them into `~/.claude/skills/` after
-yours is already running.
-
-**Demo workers sit there doing nothing.** The `claude` CLI is installed but not
-authenticated. Run `claude` once in a normal shell, sign in, then re-run
-`./demo.sh`. With no agent CLI at all, the demo falls back to plain-shell
-workers and still pings the mediator.
-
-**tmux is somewhere unusual.** `export TFMUX_TMUX_BIN=/path/to/tmux`.
+</details>
 
 ## Development
 
