@@ -61,6 +61,20 @@ slugify() {
     | sed -E 's/[^a-z0-9]+/-/g; s/-+/-/g; s/^-//; s/-$//' | cut -d- -f1-6
 }
 
+has_git_marker_upward() {
+  local dir="$1"
+  while [ -n "$dir" ]; do
+    [ -e "$dir/.git" ] && return 0
+    [ "$dir" = "/" ] && break
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+has_explicit_git_env() {
+  [ -n "${GIT_DIR:-}" ] || [ -n "${GIT_WORK_TREE:-}" ] || [ -n "${GIT_COMMON_DIR:-}" ]
+}
+
 # wtc: create a worktree + feat/<name> branch off current HEAD. Mirrors ~/.zshrc
 # (zsh defs aren't visible in a bash script, so we replicate it here).
 wtc() { wt switch -c "feat/$1" --base=@ --yes "${@:2}"; }   # --yes: approve project hooks non-interactively
@@ -152,6 +166,18 @@ assert_worktree_ready() {
   [ -e "$wt/.llm" ] || [ -L "$wt/.llm" ] || die "worktree-first invariant violated: '$wt/.llm' not initialized before launch (run dotllm init before spawning the agent)" 1
 }
 
+init_dotllm_best_effort() {
+  local dir="$1"
+  if ! command -v dotllm >/dev/null 2>&1; then
+    printf 'codex-go: NOTE - dotllm not found; continuing without .llm init in %s\n' "$dir" >&2
+    return 0
+  fi
+  dotllm trust "$dir" >/dev/null 2>&1 || true
+  if ! ( cd "$dir" && dotllm init -q >/dev/null 2>&1 ); then
+    printf 'codex-go: NOTE - dotllm init skipped in %s (plain directory unsupported or init failed)\n' "$dir" >&2
+  fi
+}
+
 resolve_cleanup_helper() {
   local c
   for c in \
@@ -219,18 +245,51 @@ fi
 # pane to bind). IN_TMUX gates the mediator bind + the notify instruction.
 IN_TMUX=0; [ -n "${TMUX:-}" ] && IN_TMUX=1
 
-# preflight (tfmux is the delivery + ping path; python3 resolves the worktree path;
-# gh is how codex opens + squash-merges the PR)
-for bin in git wt tmux dotllm tfmux python3 gh; do command -v "$bin" >/dev/null 2>&1 || die "missing dependency: $bin" 127; done
-command -v "$AGENT_SHELL" >/dev/null 2>&1 || die "missing agent shell: $AGENT_SHELL" 127
-REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not a git repo (run from inside the repo to build in)" 2
-git remote | grep -q . || die "no git remote set — codex opens + squash-merges a PR, which needs one. Add a remote (e.g. 'gh repo create --source . --remote origin --push') and retry." 2
-if ! CLEAN_HELPER="$(resolve_cleanup_helper)"; then
-  CLEAN_HELPER="$HOME/.config/skl/library/skills/tmux-factory/tmux-factory-codex-go/scripts/factory-cleanup.sh"
+RUN_DIR="${PWD:-$(pwd)}"
+REPO=""
+NO_GIT=1
+if command -v git >/dev/null 2>&1; then
+  if git_root="$(git rev-parse --show-toplevel 2>&1)"; then
+    REPO="$git_root"
+    NO_GIT=0
+  elif has_explicit_git_env || has_git_marker_upward "$RUN_DIR" || ! printf '%s' "$git_root" | grep -qi 'not a git repository'; then
+    die "git root detection failed: $git_root" 2
+  fi
+elif has_explicit_git_env || has_git_marker_upward "$RUN_DIR"; then
+  die "missing dependency: git" 127
 fi
 
+# preflight (tfmux is the delivery + ping path; python3 resolves the worktree path
+# only in git mode; gh is how codex opens + squash-merges the PR in git mode).
+if [ "$NO_GIT" = 0 ]; then
+  for bin in git wt tmux dotllm tfmux python3 gh; do command -v "$bin" >/dev/null 2>&1 || die "missing dependency: $bin" 127; done
+  git remote | grep -q . || die "no git remote set — codex opens + squash-merges a PR, which needs one. Add a remote (e.g. 'gh repo create --source . --remote origin --push') and retry." 2
+  if ! CLEAN_HELPER="$(resolve_cleanup_helper)"; then
+    CLEAN_HELPER="$HOME/.config/skl/library/skills/tmux-factory/tmux-factory-codex-go/scripts/factory-cleanup.sh"
+  fi
+else
+  for bin in tmux tfmux; do command -v "$bin" >/dev/null 2>&1 || die "missing dependency: $bin" 127; done
+fi
+command -v "$AGENT_SHELL" >/dev/null 2>&1 || die "missing agent shell: $AGENT_SHELL" 127
+
 if [ "$DRY" = 1 ]; then
-  cat <<EOF
+  if [ "$NO_GIT" = 1 ]; then
+    cat <<EOF
+# codex-go: no git repo: running in place, no PR/merge; no worktree isolation, workers edit this directory directly
++ WORK_DIR=$RUN_DIR
++ dotllm trust "\$WORK_DIR" || true             # best-effort; skipped if dotllm is unavailable
++ ( cd "\$WORK_DIR" && dotllm init -q ) || true # best-effort for plain directories
+$([ "$IN_TMUX" = 1 ] && echo "+ tfmux bind mediator --here --session $TFMUX_SESSION --role mediator --kind generic   # ping target = this pane, in session $TFMUX_SESSION" || echo "# (not in tmux → cannot bind mediator → no ping-back this run)")
++ tmux new-session -d -s "$NAME" -e TFMUX_SESSION=$TFMUX_SESSION -c "\$WORK_DIR" -- "$AGENT_SHELL" -ic '$CODEX_CMD'   # spawn detached codex in the current directory, TFMUX_SESSION exported
++ wait_ready $NAME                             # poll until codex TUI is up
++ APANE=\$(tmux list-panes -t $NAME -F '#{pane_id}' | head -1)
++ tfmux bind $NAME --tmux "\$APANE" --session $TFMUX_SESSION --role agent --kind codex
++ verified_send $NAME <prompt>                 # tfmux send plain task + in-place done/blocked ping instruction
++ tfmux attach "$NAME"                         # attach to new tmux window (if in tmux)
+session: $NAME   tfmux: $TFMUX_SESSION   workdir: $RUN_DIR   effort: $EFFORT   ping-back: $([ "$IN_TMUX" = 1 ] && echo "yes (tfmux send mediator)" || echo "no (not in tmux)")
+EOF
+  else
+    cat <<EOF
 + wtc $SLUG     # = wt switch -c feat/$SLUG --base=@   (mirrors ~/.zshrc)
 + WT=\$(wt list --format json | resolve path for $BRANCH)
 + quarantine_hook_copied_dotllm "\$WT"         # move hook-copied real .llm aside before init
@@ -247,27 +306,35 @@ $([ "$IN_TMUX" = 1 ] && echo "+ tfmux bind mediator --here --session $TFMUX_SESS
 session: $NAME   tfmux: $TFMUX_SESSION   branch: $BRANCH   effort: $EFFORT   ping-back: $([ "$IN_TMUX" = 1 ] && echo "yes (tfmux send mediator)" || echo "no (not in tmux)")
 cleanup after merged PR: $CLEAN_HELPER --session $NAME --worktree "\$WT" --branch $BRANCH --repo "$REPO" --pr <PR_URL_OR_NUMBER>
 EOF
+  fi
   exit 0
 fi
 
-git show-ref --verify --quiet "refs/heads/$BRANCH" && die "branch '$BRANCH' already exists — pass --slug to pick another" 1
+if [ "$NO_GIT" = 0 ]; then
+  git show-ref --verify --quiet "refs/heads/$BRANCH" && die "branch '$BRANCH' already exists — pass --slug to pick another" 1
 
-# 1. worktree — wtc (mirrors ~/.zshrc: wt switch -c feat/<slug> --base=@) makes the
-#    branch+worktree off current HEAD; non-interactive (no shell hook) means it does
-#    NOT cd, so the caller stays on main (a subprocess regardless).
-if ! wt_err="$(wtc "$SLUG" 2>&1)"; then
-  die "worktree creation failed (wt switch -c feat/$SLUG --base=@ --yes):
+  # 1. worktree — wtc (mirrors ~/.zshrc: wt switch -c feat/<slug> --base=@) makes the
+  #    branch+worktree off current HEAD; non-interactive (no shell hook) means it does
+  #    NOT cd, so the caller stays on main (a subprocess regardless).
+  if ! wt_err="$(wtc "$SLUG" 2>&1)"; then
+    die "worktree creation failed (wt switch -c feat/$SLUG --base=@ --yes):
 $wt_err" 1
-fi
-WT="$(wt list --format json | python3 -c "import sys,json;print(next(w['path'] for w in json.load(sys.stdin) if w.get('kind')=='worktree' and w.get('branch')=='$BRANCH'))")" \
-  || die "could not resolve the worktree path for $BRANCH" 1
-[ -n "$WT" ] || die "empty worktree path for $BRANCH" 1
+  fi
+  WT="$(wt list --format json | python3 -c "import sys,json;print(next(w['path'] for w in json.load(sys.stdin) if w.get('kind')=='worktree' and w.get('branch')=='$BRANCH'))")" \
+    || die "could not resolve the worktree path for $BRANCH" 1
+  [ -n "$WT" ] || die "empty worktree path for $BRANCH" 1
 
-# 2. prep the worktree: pre-approve (skip codex's trust prompt) + give $sf-auto a
-#    .llm project root in the worktree.
-quarantine_hook_copied_dotllm "$WT"
-dotllm trust "$WT" >/dev/null 2>&1 || true
-( cd "$WT" && dotllm init -q ) || die "dotllm init failed in $WT" 1
+  # 2. prep the worktree: pre-approve (skip codex's trust prompt) + give $sf-auto a
+  #    .llm project root in the worktree.
+  quarantine_hook_copied_dotllm "$WT"
+  dotllm trust "$WT" >/dev/null 2>&1 || true
+  ( cd "$WT" && dotllm init -q ) || die "dotllm init failed in $WT" 1
+  WORK_DIR="$WT"
+else
+  WORK_DIR="$RUN_DIR"
+  printf 'codex-go: no git repo: running in place, no PR/merge; no worktree isolation, workers edit this directory directly\n' >&2
+  init_dotllm_best_effort "$WORK_DIR"
+fi
 
 # 3. bind the caller's pane as the tfmux mediator (the ping target) IN this run's
 #    session, so codex reaches it later with `tfmux send mediator --session $TFMUX_SESSION`.
@@ -282,7 +349,11 @@ if [ "$IN_TMUX" = 1 ]; then
     printf 'codex-go: WARNING — could not bind mediator (no ping-back this run); continuing\n' >&2
   fi
 else
-  printf 'codex-go: NOTE — not in tmux; codex cannot ping back. Check the PR manually.\n' >&2
+  if [ "$NO_GIT" = 1 ]; then
+    printf 'codex-go: NOTE — not in tmux; codex cannot ping back. Check the directory manually.\n' >&2
+  else
+    printf 'codex-go: NOTE — not in tmux; codex cannot ping back. Check the PR manually.\n' >&2
+  fi
 fi
 
 # 4. spawn the DETACHED codex session and wait for its composer to come up. The
@@ -291,9 +362,15 @@ fi
 #    (-c "$WT") and TFMUX_SESSION exported (-e) — never in the main checkout with a
 #    later cd. assert_worktree_ready turns any future reordering (spawn before the
 #    worktree exists/initializes) into a loud abort instead of a wrong-directory launch.
-assert_worktree_ready "$WT"
-if ! tmux new-session -d -s "$NAME" -e TFMUX_SESSION="$TFMUX_SESSION" -c "$WT" -- "$AGENT_SHELL" -ic "$CODEX_CMD"; then
-  die "tmux session creation failed for $NAME" 1
+if [ "$NO_GIT" = 0 ]; then
+  assert_worktree_ready "$WT"
+  if ! tmux new-session -d -s "$NAME" -e TFMUX_SESSION="$TFMUX_SESSION" -c "$WT" -- "$AGENT_SHELL" -ic "$CODEX_CMD"; then
+    die "tmux session creation failed for $NAME" 1
+  fi
+else
+  if ! tmux new-session -d -s "$NAME" -e TFMUX_SESSION="$TFMUX_SESSION" -c "$WORK_DIR" -- "$AGENT_SHELL" -ic "$CODEX_CMD"; then
+    die "tmux session creation failed for $NAME" 1
+  fi
 fi
 wait_ready "$NAME" || printf 'codex-go: NOTE — codex readiness not confirmed within timeout; sending anyway (verified_send will retry)\n' >&2
 
@@ -303,11 +380,19 @@ wait_ready "$NAME" || printf 'codex-go: NOTE — codex readiness not confirmed w
 APANE="$(tmux list-panes -t "$NAME" -F '#{pane_id}' 2>/dev/null | head -1)"
 if [ -z "$APANE" ]; then
   tmux kill-session -t "$NAME" 2>/dev/null || true
-  die "could not resolve a pane id for session $NAME (killed it). Remove the worktree with: wtr $BRANCH" 1
+  if [ "$NO_GIT" = 1 ]; then
+    die "could not resolve a pane id for session $NAME (killed it). Directory left at: $WORK_DIR" 1
+  else
+    die "could not resolve a pane id for session $NAME (killed it). Remove the worktree with: wtr $BRANCH" 1
+  fi
 fi
 if ! tfmux bind "$NAME" --tmux "$APANE" --session "$TFMUX_SESSION" --role agent --kind codex >/dev/null 2>&1; then
   tmux kill-session -t "$NAME" 2>/dev/null || true
-  die "tfmux bind failed for $NAME ($APANE) (killed the session). Remove the worktree with: wtr $BRANCH" 1
+  if [ "$NO_GIT" = 1 ]; then
+    die "tfmux bind failed for $NAME ($APANE) (killed the session). Directory left at: $WORK_DIR" 1
+  else
+    die "tfmux bind failed for $NAME ($APANE) (killed the session). Remove the worktree with: wtr $BRANCH" 1
+  fi
 fi
 
 # 6. build the prompt (verbatim $sf-auto feature + the done-notify instruction when
@@ -315,17 +400,36 @@ fi
 PROMPT_FILE="$(mktemp -t codexgo-prompt.XXXXXX)"
 trap 'rm -f "$PROMPT_FILE"' EXIT
 {
-  printf '$sf-auto %s\n' "$FEATURE"             # literal $sf-auto + the verbatim feature
-  if [ "$NOTIFY" = 1 ]; then
-    printf '\n---\n'
-    printf 'When you are completely finished — the PR is squash-merged to main, OR you hit a true blocker you cannot resolve — your FINAL action MUST be to notify the mediator by running this exact command (run it verbatim, just replace <status>):\n\n'
-    printf "tfmux send mediator --session %s --text '<status>'\n\n" "$TFMUX_SESSION"
-    printf '<status> is ONE line, no single quotes: on success  \xe2\x9c\x85 %s merged: <PR url>  ·  on blocker  \xe2\x9a\xa0\xef\xb8\x8f %s blocked: <one-line reason>. Do not skip this final step.\n' "$SLUG" "$SLUG"
+  if [ "$NO_GIT" = 1 ]; then
+    printf '%s\n\n' "$FEATURE"
+    printf 'Do not use the software-factory PR/merge loop for this task: this directory is not a git repo, so there is no PR or merge loop. Work directly in the current directory and make the requested changes here.\n'
+    if [ "$NOTIFY" = 1 ]; then
+      printf '\n---\n'
+      printf 'When you are completely finished with this task — OR you hit a true blocker you cannot resolve — your FINAL action MUST be to notify the mediator by running this exact command (run it verbatim, just replace <status>):\n\n'
+      printf "tfmux send mediator --session %s --text '<status>'\n\n" "$TFMUX_SESSION"
+      printf '<status> is ONE line, no single quotes: on success  \xe2\x9c\x85 %s done: <one-line summary>  ·  on blocker  \xe2\x9a\xa0\xef\xb8\x8f %s blocked: <one-line reason>. Do not skip this final step.\n' "$SLUG" "$SLUG"
+    fi
+  else
+    printf '$sf-auto %s\n' "$FEATURE"             # literal $sf-auto + the verbatim feature
+    if [ "$NOTIFY" = 1 ]; then
+      printf '\n---\n'
+      printf 'When you are completely finished — the PR is squash-merged to main, OR you hit a true blocker you cannot resolve — your FINAL action MUST be to notify the mediator by running this exact command (run it verbatim, just replace <status>):\n\n'
+      printf "tfmux send mediator --session %s --text '<status>'\n\n" "$TFMUX_SESSION"
+      printf '<status> is ONE line, no single quotes: on success  \xe2\x9c\x85 %s merged: <PR url>  ·  on blocker  \xe2\x9a\xa0\xef\xb8\x8f %s blocked: <one-line reason>. Do not skip this final step.\n' "$SLUG" "$SLUG"
+    fi
   fi
 } > "$PROMPT_FILE"
 
-verified_send "$NAME" "$PROMPT_FILE" \
-  || printf 'codex-go: WARNING — prompt may not have registered for %s; inspect with: tmux capture-pane -p -t %s\n' "$NAME" "$NAME" >&2
+if ! verified_send "$NAME" "$PROMPT_FILE"; then
+  if [ "$NO_GIT" = 1 ]; then
+    printf 'codex-go: ERROR — prompt delivery was not confirmed for %s after retries\n' "$NAME" >&2
+    printf 'codex-go: last pane capture follows:\n' >&2
+    tmux capture-pane -p -t "$NAME" 2>/dev/null | tail -40 >&2 || true
+    tmux kill-session -t "$NAME" 2>/dev/null || true
+    die "killed unstarted session $NAME. Directory is left at $WORK_DIR; retry after inspecting it." 1
+  fi
+  printf 'codex-go: WARNING — prompt may not have registered for %s; inspect with: tmux capture-pane -p -t %s\n' "$NAME" "$NAME" >&2
+fi
 
 # 7. attach to the current tmux session in a new window (best-effort, tfmux-native)
 ATTACHED=""
@@ -336,15 +440,16 @@ if [ "$IN_TMUX" = 1 ]; then
 fi
 
 # 8. report the handles
-printf -v CLEANUP_CMD '%q --session %q --worktree %q --branch %q --repo %q --pr <PR_URL_OR_NUMBER>' "$CLEAN_HELPER" "$NAME" "$WT" "$BRANCH" "$REPO"
-if [ "$NOTIFY" = 1 ]; then
-  PING_LINE="→ ping-back:    codex 'tfmux send mediator's a status line to THIS pane when done (stay idle to catch it; if none in ~15 min, check the PR below — the ping depends on codex running the final step)"
-elif [ "$IN_TMUX" = 1 ]; then
-  PING_LINE="→ no ping-back: mediator bind failed (see warning above) — check the PR manually below"
-else
-  PING_LINE="→ no ping-back: not in tmux — codex can't ping; check the PR manually below"
-fi
-cat <<EOF
+if [ "$NO_GIT" = 0 ]; then
+  printf -v CLEANUP_CMD '%q --session %q --worktree %q --branch %q --repo %q --pr <PR_URL_OR_NUMBER>' "$CLEAN_HELPER" "$NAME" "$WT" "$BRANCH" "$REPO"
+  if [ "$NOTIFY" = 1 ]; then
+    PING_LINE="→ ping-back:    codex 'tfmux send mediator's a status line to THIS pane when done (stay idle to catch it; if none in ~15 min, check the PR below — the ping depends on codex running the final step)"
+  elif [ "$IN_TMUX" = 1 ]; then
+    PING_LINE="→ no ping-back: mediator bind failed (see warning above) — check the PR manually below"
+  else
+    PING_LINE="→ no ping-back: not in tmux — codex can't ping; check the PR manually below"
+  fi
+  cat <<EOF
 
 spawned:  $NAME
 worktree: $WT
@@ -356,3 +461,22 @@ $PING_LINE
 → check later:  gh pr list --head $BRANCH --state all     ·   watch: tmux attach -t $NAME
 → after merge:  $CLEANUP_CMD
 EOF
+else
+  if [ "$NOTIFY" = 1 ]; then
+    PING_LINE="→ ping-back:    codex 'tfmux send mediator's a done/blocked status line to THIS pane when done (stay idle to catch it; if none in ~15 min, check the directory below — the ping depends on codex running the final step)"
+  elif [ "$IN_TMUX" = 1 ]; then
+    PING_LINE="→ no ping-back: mediator bind failed (see warning above) — check the directory manually below"
+  else
+    PING_LINE="→ no ping-back: not in tmux — codex can't ping; check the directory manually below"
+  fi
+  cat <<EOF
+
+spawned:  $NAME
+workdir:  $WORK_DIR
+tfmux:    $TFMUX_SESSION
+codex is running in-place in this directory. No PR or squash-merge will be created.
+→ status:       $ATTACHED
+$PING_LINE
+→ check later:  cd "$WORK_DIR"       (worker edits this directory directly)   ·   watch: tmux attach -t $NAME
+EOF
+fi

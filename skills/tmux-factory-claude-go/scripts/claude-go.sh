@@ -60,6 +60,20 @@ slugify() {
     | sed -E 's/[^a-z0-9]+/-/g; s/-+/-/g; s/^-//; s/-$//' | cut -d- -f1-6
 }
 
+has_git_marker_upward() {
+  local dir="$1"
+  while [ -n "$dir" ]; do
+    [ -e "$dir/.git" ] && return 0
+    [ "$dir" = "/" ] && break
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+has_explicit_git_env() {
+  [ -n "${GIT_DIR:-}" ] || [ -n "${GIT_WORK_TREE:-}" ] || [ -n "${GIT_COMMON_DIR:-}" ]
+}
+
 # wtc: create a worktree + feat/<name> branch off current HEAD. Mirrors ~/.zshrc
 # (zsh defs aren't visible in a bash script, so we replicate it here).
 wtc() { wt switch -c "feat/$1" --base=@ --yes "${@:2}"; }   # --yes: approve project hooks non-interactively
@@ -178,6 +192,18 @@ assert_worktree_ready() {
   [ -e "$wt/.llm" ] || [ -L "$wt/.llm" ] || die "worktree-first invariant violated: '$wt/.llm' not initialized before launch (run dotllm init before spawning the agent)" 1
 }
 
+init_dotllm_best_effort() {
+  local dir="$1"
+  if ! command -v dotllm >/dev/null 2>&1; then
+    printf 'claude-go: NOTE - dotllm not found; continuing without .llm init in %s\n' "$dir" >&2
+    return 0
+  fi
+  dotllm trust "$dir" >/dev/null 2>&1 || true
+  if ! ( cd "$dir" && dotllm init -q >/dev/null 2>&1 ); then
+    printf 'claude-go: NOTE - dotllm init skipped in %s (plain directory unsupported or init failed)\n' "$dir" >&2
+  fi
+}
+
 resolve_cleanup_helper() {
   local c
   for c in \
@@ -259,18 +285,51 @@ fi
 # pane to bind). IN_TMUX gates the mediator bind + the notify instruction.
 IN_TMUX=0; [ -n "${TMUX:-}" ] && IN_TMUX=1
 
-# preflight (tfmux is the delivery + ping path; python3 resolves the worktree path).
-# No gh / git remote requirement — Claude works directly in the worktree, it does
-# not open or merge a PR.
-for bin in git wt tmux dotllm tfmux python3; do command -v "$bin" >/dev/null 2>&1 || die "missing dependency: $bin" 127; done
-command -v "$AGENT_SHELL" >/dev/null 2>&1 || die "missing agent shell: $AGENT_SHELL" 127
-REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not a git repo (run from inside the repo to work on)" 2
-if ! CLEAN_HELPER="$(resolve_cleanup_helper)"; then
-  CLEAN_HELPER="$HOME/.config/skl/library/skills/tmux-factory/tmux-factory-codex-go/scripts/factory-cleanup.sh"
+RUN_DIR="${PWD:-$(pwd)}"
+REPO=""
+NO_GIT=1
+if command -v git >/dev/null 2>&1; then
+  if git_root="$(git rev-parse --show-toplevel 2>&1)"; then
+    REPO="$git_root"
+    NO_GIT=0
+  elif has_explicit_git_env || has_git_marker_upward "$RUN_DIR" || ! printf '%s' "$git_root" | grep -qi 'not a git repository'; then
+    die "git root detection failed: $git_root" 2
+  fi
+elif has_explicit_git_env || has_git_marker_upward "$RUN_DIR"; then
+  die "missing dependency: git" 127
 fi
 
+# preflight (tfmux is the delivery + ping path; python3 resolves the worktree path
+# only in git mode). No gh / git remote requirement — Claude does not open or
+# merge a PR.
+if [ "$NO_GIT" = 0 ]; then
+  for bin in git wt tmux dotllm tfmux python3; do command -v "$bin" >/dev/null 2>&1 || die "missing dependency: $bin" 127; done
+  if ! CLEAN_HELPER="$(resolve_cleanup_helper)"; then
+    CLEAN_HELPER="$HOME/.config/skl/library/skills/tmux-factory/tmux-factory-codex-go/scripts/factory-cleanup.sh"
+  fi
+else
+  for bin in tmux tfmux; do command -v "$bin" >/dev/null 2>&1 || die "missing dependency: $bin" 127; done
+fi
+command -v "$AGENT_SHELL" >/dev/null 2>&1 || die "missing agent shell: $AGENT_SHELL" 127
+
 if [ "$DRY" = 1 ]; then
-  cat <<EOF
+  if [ "$NO_GIT" = 1 ]; then
+    cat <<EOF
+# claude-go: no git repo: running in place; no worktree isolation, workers edit this directory directly
++ WORK_DIR=$RUN_DIR
++ dotllm trust "\$WORK_DIR" || true             # best-effort; skipped if dotllm is unavailable
++ ( cd "\$WORK_DIR" && dotllm init -q ) || true # best-effort for plain directories
+$([ "$IN_TMUX" = 1 ] && echo "+ tfmux bind mediator --here --session $TFMUX_SESSION --role mediator --kind generic   # ping target = this pane, in session $TFMUX_SESSION" || echo "# (not in tmux → cannot bind mediator → no ping-back this run)")
++ tmux new-session -d -s "$NAME" -e TFMUX_SESSION=$TFMUX_SESSION -c "\$WORK_DIR" -- "$AGENT_SHELL" -ic '$CLAUDE_CMD'   # spawn detached Claude in the current directory, TFMUX_SESSION exported
++ wait_ready $NAME                             # poll until Claude TUI is up
++ APANE=\$(tmux list-panes -t $NAME -F '#{pane_id}' | head -1)
++ tfmux bind $NAME --tmux "\$APANE" --session $TFMUX_SESSION --role agent --kind claude
++ verified_send $NAME <prompt>                 # tfmux send '<task>'$([ "$IN_TMUX" = 1 ] && echo " + 'when done: tfmux send mediator …'") (fail hard if not confirmed)
++ tfmux attach "$NAME"                         # attach to new tmux window (if in tmux)
+session: $NAME   tfmux: $TFMUX_SESSION   workdir: $RUN_DIR   effort: $EFFORT   ping-back: $([ "$IN_TMUX" = 1 ] && echo "yes (tfmux send mediator)" || echo "no (not in tmux)")
+EOF
+  else
+    cat <<EOF
 + wtc $SLUG     # = wt switch -c feat/$SLUG --base=@   (mirrors ~/.zshrc)
 + WT=\$(wt list --format json | resolve path for $BRANCH)
 + quarantine_hook_copied_dotllm "\$WT"         # move hook-copied real .llm aside before init
@@ -287,29 +346,37 @@ $([ "$IN_TMUX" = 1 ] && echo "+ tfmux bind mediator --here --session $TFMUX_SESS
 session: $NAME   tfmux: $TFMUX_SESSION   branch: $BRANCH   effort: $EFFORT   ping-back: $([ "$IN_TMUX" = 1 ] && echo "yes (tfmux send mediator)" || echo "no (not in tmux)")
 cleanup after merged PR: $CLEAN_HELPER --session $NAME --worktree "\$WT" --branch $BRANCH --repo "$REPO" --pr <PR_URL_OR_NUMBER>
 EOF
+  fi
   exit 0
 fi
 
 validate_agent_command
 
-git show-ref --verify --quiet "refs/heads/$BRANCH" && die "branch '$BRANCH' already exists — pass --slug to pick another" 1
+if [ "$NO_GIT" = 0 ]; then
+  git show-ref --verify --quiet "refs/heads/$BRANCH" && die "branch '$BRANCH' already exists — pass --slug to pick another" 1
 
-# 1. worktree — wtc (mirrors ~/.zshrc: wt switch -c feat/<slug> --base=@) makes the
-#    branch+worktree off current HEAD; non-interactive (no shell hook) means it does
-#    NOT cd, so the caller stays on main (a subprocess regardless).
-if ! wt_err="$(wtc "$SLUG" 2>&1)"; then
-  die "worktree creation failed (wt switch -c feat/$SLUG --base=@ --yes):
+  # 1. worktree — wtc (mirrors ~/.zshrc: wt switch -c feat/<slug> --base=@) makes the
+  #    branch+worktree off current HEAD; non-interactive (no shell hook) means it does
+  #    NOT cd, so the caller stays on main (a subprocess regardless).
+  if ! wt_err="$(wtc "$SLUG" 2>&1)"; then
+    die "worktree creation failed (wt switch -c feat/$SLUG --base=@ --yes):
 $wt_err" 1
-fi
-WT="$(wt list --format json | python3 -c "import sys,json;print(next(w['path'] for w in json.load(sys.stdin) if w.get('kind')=='worktree' and w.get('branch')=='$BRANCH'))")" \
-  || die "could not resolve the worktree path for $BRANCH" 1
-[ -n "$WT" ] || die "empty worktree path for $BRANCH" 1
+  fi
+  WT="$(wt list --format json | python3 -c "import sys,json;print(next(w['path'] for w in json.load(sys.stdin) if w.get('kind')=='worktree' and w.get('branch')=='$BRANCH'))")" \
+    || die "could not resolve the worktree path for $BRANCH" 1
+  [ -n "$WT" ] || die "empty worktree path for $BRANCH" 1
 
-# 2. prep the worktree: pre-approve (skip the trust prompt) + give Claude a .llm
-#    project root in the worktree for its scratch.
-quarantine_hook_copied_dotllm "$WT"
-dotllm trust "$WT" >/dev/null 2>&1 || true
-( cd "$WT" && dotllm init -q ) || die "dotllm init failed in $WT" 1
+  # 2. prep the worktree: pre-approve (skip the trust prompt) + give Claude a .llm
+  #    project root in the worktree for its scratch.
+  quarantine_hook_copied_dotllm "$WT"
+  dotllm trust "$WT" >/dev/null 2>&1 || true
+  ( cd "$WT" && dotllm init -q ) || die "dotllm init failed in $WT" 1
+  WORK_DIR="$WT"
+else
+  WORK_DIR="$RUN_DIR"
+  printf 'claude-go: no git repo: running in place; no worktree isolation, workers edit this directory directly\n' >&2
+  init_dotllm_best_effort "$WORK_DIR"
+fi
 
 # 3. bind the caller's pane as the tfmux mediator (the ping target) IN this run's
 #    session, so Claude reaches it later with `tfmux send mediator --session $TFMUX_SESSION`.
@@ -324,7 +391,11 @@ if [ "$IN_TMUX" = 1 ]; then
     printf 'claude-go: WARNING — could not bind mediator (no ping-back this run); continuing\n' >&2
   fi
 else
-  printf 'claude-go: NOTE — not in tmux; Claude cannot ping back. Check the worktree manually.\n' >&2
+  if [ "$NO_GIT" = 1 ]; then
+    printf 'claude-go: NOTE — not in tmux; Claude cannot ping back. Check the directory manually.\n' >&2
+  else
+    printf 'claude-go: NOTE — not in tmux; Claude cannot ping back. Check the worktree manually.\n' >&2
+  fi
 fi
 
 # 4. spawn the DETACHED Claude session and wait for its composer to come up. The
@@ -333,9 +404,15 @@ fi
 #    (-c "$WT") and TFMUX_SESSION exported (-e) — never in the main checkout with a
 #    later cd. assert_worktree_ready turns any future reordering (spawn before the
 #    worktree exists/initializes) into a loud abort instead of a wrong-directory launch.
-assert_worktree_ready "$WT"
-if ! tmux new-session -d -s "$NAME" -e TFMUX_SESSION="$TFMUX_SESSION" -c "$WT" -- "$AGENT_SHELL" -ic "$CLAUDE_CMD"; then
-  die "tmux session creation failed for $NAME" 1
+if [ "$NO_GIT" = 0 ]; then
+  assert_worktree_ready "$WT"
+  if ! tmux new-session -d -s "$NAME" -e TFMUX_SESSION="$TFMUX_SESSION" -c "$WT" -- "$AGENT_SHELL" -ic "$CLAUDE_CMD"; then
+    die "tmux session creation failed for $NAME" 1
+  fi
+else
+  if ! tmux new-session -d -s "$NAME" -e TFMUX_SESSION="$TFMUX_SESSION" -c "$WORK_DIR" -- "$AGENT_SHELL" -ic "$CLAUDE_CMD"; then
+    die "tmux session creation failed for $NAME" 1
+  fi
 fi
 wait_ready "$NAME" || printf 'claude-go: NOTE — Claude readiness not confirmed within timeout; sending anyway (verified_send will retry)\n' >&2
 
@@ -345,11 +422,19 @@ wait_ready "$NAME" || printf 'claude-go: NOTE — Claude readiness not confirmed
 APANE="$(tmux list-panes -t "$NAME" -F '#{pane_id}' 2>/dev/null | head -1)"
 if [ -z "$APANE" ]; then
   tmux kill-session -t "$NAME" 2>/dev/null || true
-  die "could not resolve a pane id for session $NAME (killed it). Remove the worktree with: wtr $BRANCH" 1
+  if [ "$NO_GIT" = 1 ]; then
+    die "could not resolve a pane id for session $NAME (killed it). Directory left at: $WORK_DIR" 1
+  else
+    die "could not resolve a pane id for session $NAME (killed it). Remove the worktree with: wtr $BRANCH" 1
+  fi
 fi
 if ! tfmux bind "$NAME" --tmux "$APANE" --session "$TFMUX_SESSION" --role agent --kind claude >/dev/null 2>&1; then
   tmux kill-session -t "$NAME" 2>/dev/null || true
-  die "tfmux bind failed for $NAME ($APANE) (killed the session). Remove the worktree with: wtr $BRANCH" 1
+  if [ "$NO_GIT" = 1 ]; then
+    die "tfmux bind failed for $NAME ($APANE) (killed the session). Directory left at: $WORK_DIR" 1
+  else
+    die "tfmux bind failed for $NAME ($APANE) (killed the session). Remove the worktree with: wtr $BRANCH" 1
+  fi
 fi
 
 # 6. build the prompt (verbatim task + the done-notify instruction when a mediator
@@ -373,7 +458,11 @@ if ! verified_send "$NAME" "$PROMPT_FILE"; then
   printf 'claude-go: last pane capture follows:\n' >&2
   capture_pane "$NAME" | tail -40 >&2 || true
   tmux kill-session -t "$NAME" 2>/dev/null || true
-  die "killed unstarted session $NAME. Worktree is left at $WT; retry after inspecting with: wts $SLUG" 1
+  if [ "$NO_GIT" = 1 ]; then
+    die "killed unstarted session $NAME. Directory is left at $WORK_DIR; retry after inspecting it." 1
+  else
+    die "killed unstarted session $NAME. Worktree is left at $WT; retry after inspecting with: wts $SLUG" 1
+  fi
 fi
 
 # 7. attach to the current tmux session in a new window (best-effort, tfmux-native)
@@ -385,15 +474,16 @@ if [ "$IN_TMUX" = 1 ]; then
 fi
 
 # 8. report the handles
-printf -v CLEANUP_CMD '%q --session %q --worktree %q --branch %q --repo %q --pr <PR_URL_OR_NUMBER>' "$CLEAN_HELPER" "$NAME" "$WT" "$BRANCH" "$REPO"
-if [ "$NOTIFY" = 1 ]; then
-  PING_LINE="→ ping-back:    Claude 'tfmux send mediator's a status line to THIS pane when done (stay idle to catch it; if none in ~15 min, check the worktree below — the ping depends on Claude running the final step)"
-elif [ "$IN_TMUX" = 1 ]; then
-  PING_LINE="→ no ping-back: mediator bind failed (see warning above) — check the worktree manually below"
-else
-  PING_LINE="→ no ping-back: not in tmux — Claude can't ping; check the worktree manually below"
-fi
-cat <<EOF
+if [ "$NO_GIT" = 0 ]; then
+  printf -v CLEANUP_CMD '%q --session %q --worktree %q --branch %q --repo %q --pr <PR_URL_OR_NUMBER>' "$CLEAN_HELPER" "$NAME" "$WT" "$BRANCH" "$REPO"
+  if [ "$NOTIFY" = 1 ]; then
+    PING_LINE="→ ping-back:    Claude 'tfmux send mediator's a status line to THIS pane when done (stay idle to catch it; if none in ~15 min, check the worktree below — the ping depends on Claude running the final step)"
+  elif [ "$IN_TMUX" = 1 ]; then
+    PING_LINE="→ no ping-back: mediator bind failed (see warning above) — check the worktree manually below"
+  else
+    PING_LINE="→ no ping-back: not in tmux — Claude can't ping; check the worktree manually below"
+  fi
+  cat <<EOF
 
 spawned:  $NAME
 worktree: $WT
@@ -406,3 +496,23 @@ $PING_LINE
 → watch live:   tmux attach -t $NAME   ·   tmux capture-pane -p -t $NAME | tail -80
 → after merge:  $CLEANUP_CMD
 EOF
+else
+  if [ "$NOTIFY" = 1 ]; then
+    PING_LINE="→ ping-back:    Claude 'tfmux send mediator's a status line to THIS pane when done (stay idle to catch it; if none in ~15 min, check the directory below — the ping depends on Claude running the final step)"
+  elif [ "$IN_TMUX" = 1 ]; then
+    PING_LINE="→ no ping-back: mediator bind failed (see warning above) — check the directory manually below"
+  else
+    PING_LINE="→ no ping-back: not in tmux — Claude can't ping; check the directory manually below"
+  fi
+  cat <<EOF
+
+spawned:  $NAME
+workdir:  $WORK_DIR
+tfmux:    $TFMUX_SESSION
+Claude is running independently in-place with configured reasoning effort (default: claudex/max).
+→ status:       $ATTACHED
+$PING_LINE
+→ check:        cd "$WORK_DIR"       (worker edits this directory directly)
+→ watch live:   tmux attach -t $NAME   ·   tmux capture-pane -p -t $NAME | tail -80
+EOF
+fi
